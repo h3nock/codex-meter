@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs::{self, File},
     io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -14,17 +13,12 @@ const SESSION_TAIL_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct MeterSnapshot {
-    pub codex_home: PathBuf,
     pub scanned_files: usize,
     pub available_session_files: usize,
-    pub archived_session_files: usize,
     pub malformed_lines: usize,
     pub tail_scanned_files: usize,
-    pub event_counts: BTreeMap<String, u64>,
-    pub scanned_total_usage: TokenUsage,
     pub latest_session: Option<SessionSummary>,
     pub current_rate_limits: Option<RateLimits>,
-    pub recent_session_totals: Vec<u64>,
     pub recent_sessions: Vec<SessionSummary>,
     pub scanned_at: Option<SystemTime>,
 }
@@ -32,16 +26,10 @@ pub struct MeterSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct SessionSummary {
     pub modified_at: Option<SystemTime>,
-    pub started_at: Option<String>,
-    pub last_event_at: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
-    pub context_window: Option<u64>,
-    pub total_usage: TokenUsage,
     pub last_usage: TokenUsage,
     pub rate_limits: Option<RateLimits>,
-    pub event_counts: BTreeMap<String, u64>,
-    pub line_count: usize,
     pub malformed_lines: usize,
     pub tail_scanned: bool,
     pub bytes_scanned: u64,
@@ -81,17 +69,11 @@ pub struct RateWindow {
 
 #[derive(Debug, Deserialize)]
 struct LogEntry {
-    timestamp: Option<String>,
-    #[serde(rename = "type")]
-    entry_type: Option<String>,
     payload: Option<Payload>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Payload {
-    #[serde(rename = "type")]
-    payload_type: Option<String>,
-    timestamp: Option<String>,
     model: Option<String>,
     model_provider: Option<String>,
     info: Option<UsageInfo>,
@@ -101,8 +83,6 @@ struct Payload {
 #[derive(Debug, Deserialize)]
 struct UsageInfo {
     last_token_usage: Option<TokenUsage>,
-    total_token_usage: Option<TokenUsage>,
-    model_context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,23 +97,18 @@ pub fn scan_codex_home(codex_home: &Path, max_files: usize) -> AppResult<MeterSn
     }
 
     let sessions_dir = codex_home.join("sessions");
-    let archived_dir = codex_home.join("archived_sessions");
     let mut session_files = collect_jsonl_files(&sessions_dir)?;
     session_files.sort_by(|left, right| right.modified_at.cmp(&left.modified_at));
 
-    let archived_session_files = count_jsonl_files(&archived_dir)?;
     let available_session_files = session_files.len();
 
     let mut snapshot = MeterSnapshot {
-        codex_home: codex_home.to_path_buf(),
         available_session_files,
-        archived_session_files,
         scanned_at: Some(SystemTime::now()),
         ..MeterSnapshot::default()
     };
     let mut fallback_model = None;
     let mut fallback_provider = None;
-    let mut fallback_context_window = None;
 
     for file in session_files.into_iter().take(max_files) {
         let summary = parse_session_file(&file.path, file.modified_at)?;
@@ -141,11 +116,6 @@ pub fn scan_codex_home(codex_home: &Path, max_files: usize) -> AppResult<MeterSn
         snapshot.malformed_lines += summary.malformed_lines;
         if summary.tail_scanned {
             snapshot.tail_scanned_files += 1;
-        }
-        snapshot.scanned_total_usage += summary.total_usage;
-
-        for (event, count) in &summary.event_counts {
-            *snapshot.event_counts.entry(event.clone()).or_default() += count;
         }
 
         if should_replace_rate_limits(
@@ -160,12 +130,6 @@ pub fn scan_codex_home(codex_home: &Path, max_files: usize) -> AppResult<MeterSn
         if fallback_provider.is_none() {
             fallback_provider = summary.provider.clone();
         }
-        if fallback_context_window.is_none() {
-            fallback_context_window = summary.context_window;
-        }
-        snapshot
-            .recent_session_totals
-            .push(summary.total_usage.total_tokens);
         if snapshot.latest_session.is_none() {
             snapshot.latest_session = Some(summary.clone());
         }
@@ -178,9 +142,6 @@ pub fn scan_codex_home(codex_home: &Path, max_files: usize) -> AppResult<MeterSn
         }
         if latest.provider.is_none() {
             latest.provider = fallback_provider;
-        }
-        if latest.context_window.is_none() {
-            latest.context_window = fallback_context_window;
         }
     }
 
@@ -276,10 +237,6 @@ fn collect_jsonl_files_inner(root: &Path, files: &mut Vec<SessionFile>) -> AppRe
     Ok(())
 }
 
-fn count_jsonl_files(root: &Path) -> AppResult<usize> {
-    collect_jsonl_files(root).map(|files| files.len())
-}
-
 fn parse_session_file(path: &Path, modified_at: Option<SystemTime>) -> AppResult<SessionSummary> {
     parse_session_file_with_tail_limit(path, modified_at, SESSION_TAIL_BYTES)
 }
@@ -351,7 +308,6 @@ fn parse_session_reader<R: BufRead>(
             continue;
         }
 
-        summary.line_count += 1;
         match serde_json::from_str::<LogEntry>(&line) {
             Ok(entry) => apply_entry(&mut summary, entry),
             Err(_) => summary.malformed_lines += 1,
@@ -362,27 +318,7 @@ fn parse_session_reader<R: BufRead>(
 }
 
 fn apply_entry(summary: &mut SessionSummary, entry: LogEntry) {
-    let payload = entry.payload;
-    let payload_type = payload
-        .as_ref()
-        .and_then(|payload| payload.payload_type.as_deref());
-
-    let event_name = event_name(entry.entry_type.as_deref(), payload_type);
-    *summary.event_counts.entry(event_name).or_default() += 1;
-
-    if summary.started_at.is_none() {
-        summary.started_at = entry.timestamp.clone();
-    }
-
-    if let Some(timestamp) = entry.timestamp.or_else(|| {
-        payload
-            .as_ref()
-            .and_then(|payload| payload.timestamp.clone())
-    }) {
-        summary.last_event_at = Some(timestamp);
-    }
-
-    let Some(payload) = payload else {
+    let Some(payload) = entry.payload else {
         return;
     };
 
@@ -394,39 +330,14 @@ fn apply_entry(summary: &mut SessionSummary, entry: LogEntry) {
         summary.provider = Some(provider);
     }
 
-    if let Some(info) = payload.info {
-        if let Some(total) = info.total_token_usage {
-            summary.total_usage = total;
-        }
-        if let Some(last) = info.last_token_usage {
-            summary.last_usage = last;
-        }
-        if let Some(context_window) = info.model_context_window {
-            summary.context_window = Some(context_window);
-        }
+    if let Some(info) = payload.info
+        && let Some(last) = info.last_token_usage
+    {
+        summary.last_usage = last;
     }
 
     if let Some(rate_limits) = payload.rate_limits {
         summary.rate_limits = Some(rate_limits);
-    }
-}
-
-fn event_name(entry_type: Option<&str>, payload_type: Option<&str>) -> String {
-    match (entry_type, payload_type) {
-        (Some(entry), Some(payload)) => format!("{entry}/{payload}"),
-        (Some(entry), None) => entry.to_string(),
-        (None, Some(payload)) => payload.to_string(),
-        (None, None) => "unknown".to_string(),
-    }
-}
-
-impl std::ops::AddAssign for TokenUsage {
-    fn add_assign(&mut self, rhs: Self) {
-        self.input_tokens += rhs.input_tokens;
-        self.cached_input_tokens += rhs.cached_input_tokens;
-        self.output_tokens += rhs.output_tokens;
-        self.reasoning_output_tokens += rhs.reasoning_output_tokens;
-        self.total_tokens += rhs.total_tokens;
     }
 }
 
@@ -444,16 +355,15 @@ mod tests {
     fn parses_usage_rate_limits_and_model_without_content() {
         let input = r#"
 {"timestamp":"2026-06-03T10:00:00Z","type":"turn_context","payload":{"model":"gpt-5.5"}}
-{"timestamp":"2026-06-03T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":5,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":12},"total_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":120},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":42.5,"window_minutes":300,"resets_at":1780492992},"secondary":{"used_percent":71.0,"window_minutes":10080,"resets_at":1780846619},"credits":null,"plan_type":"pro","rate_limit_reached_type":null}}}
+{"timestamp":"2026-06-03T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":5,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":12}},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":42.5,"window_minutes":300,"resets_at":1780492992},"secondary":{"used_percent":71.0,"window_minutes":10080,"resets_at":1780846619},"credits":null,"plan_type":"pro","rate_limit_reached_type":null}}}
 "#;
 
         let summary =
             parse_session_reader(Some(UNIX_EPOCH), Cursor::new(input)).expect("valid fixture");
 
         assert_eq!(summary.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(summary.total_usage.total_tokens, 120);
+        assert_eq!(summary.last_usage.total_tokens, 12);
         assert_eq!(summary.last_usage.cached_input_tokens, 5);
-        assert_eq!(summary.context_window, Some(258400));
         assert_eq!(
             summary
                 .rate_limits
@@ -462,7 +372,6 @@ mod tests {
                 .and_then(|window| window.used_percent),
             Some(42.5)
         );
-        assert_eq!(summary.event_counts.get("event_msg/token_count"), Some(&1));
     }
 
     #[test]
@@ -470,47 +379,51 @@ mod tests {
         let root = unique_temp_dir("codex-meter-tail");
         fs::create_dir_all(&root).expect("create root");
         let path = root.join("large.jsonl");
-        let old_line = "{\"timestamp\":\"2026-06-03T09:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":1}}}}\n";
+        let old_line = "{\"timestamp\":\"2026-06-03T09:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":1}}}}\n";
         let filler = "x".repeat(512);
-        let recent_line = "{\"timestamp\":\"2026-06-03T10:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":99}}}}\n";
+        let recent_line = "{\"timestamp\":\"2026-06-03T10:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":99}}}}\n";
         fs::write(&path, format!("{old_line}{filler}\n{recent_line}")).expect("write fixture");
 
         let summary =
             parse_session_file_with_tail_limit(&path, Some(UNIX_EPOCH), 256).expect("tail scan");
 
         assert!(summary.tail_scanned);
-        assert_eq!(summary.total_usage.total_tokens, 99);
+        assert_eq!(summary.last_usage.total_tokens, 99);
         assert_eq!(summary.malformed_lines, 0);
 
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
-    fn scanner_aggregates_recent_files_and_bad_lines() {
+    fn scanner_collects_recent_files_and_bad_lines() {
         let root = unique_temp_dir("codex-meter-scan");
         let sessions = root.join("sessions").join("2026").join("06").join("03");
         fs::create_dir_all(&sessions).expect("create sessions");
-        fs::create_dir_all(root.join("archived_sessions")).expect("create archive");
 
         fs::write(
             sessions.join("one.jsonl"),
-            r#"{"timestamp":"2026-06-03T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10}}}}"#,
+            r#"{"timestamp":"2026-06-03T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":10}}}}"#,
         )
         .expect("write one");
         fs::write(
             sessions.join("two.jsonl"),
-            "not json\n{\"timestamp\":\"2026-06-03T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":20}}}}\n",
+            "not json\n{\"timestamp\":\"2026-06-03T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":20}}}}\n",
         )
         .expect("write two");
-        fs::write(root.join("archived_sessions").join("old.jsonl"), "{}\n").expect("archive");
 
         let snapshot = scan_codex_home(&root, 64).expect("scan");
 
         assert_eq!(snapshot.available_session_files, 2);
-        assert_eq!(snapshot.archived_session_files, 1);
         assert_eq!(snapshot.scanned_files, 2);
         assert_eq!(snapshot.malformed_lines, 1);
-        assert_eq!(snapshot.scanned_total_usage.total_tokens, 30);
+        assert_eq!(snapshot.recent_sessions.len(), 2);
+        let mut turn_totals = snapshot
+            .recent_sessions
+            .iter()
+            .map(|session| session.last_usage.total_tokens)
+            .collect::<Vec<u64>>();
+        turn_totals.sort_unstable();
+        assert_eq!(turn_totals, vec![10, 20]);
 
         fs::remove_dir_all(root).expect("cleanup");
     }

@@ -20,7 +20,7 @@ use ratatui::{
 
 use crate::{
     cli::DashboardOptions,
-    codex::{MeterSnapshot, RateWindow, SessionSummary, TokenUsage, scan_codex_home},
+    codex::{MeterSnapshot, RateWindow, TokenUsage, scan_codex_home},
     error::{AppError, AppResult},
     format,
 };
@@ -212,11 +212,7 @@ fn draw_header(
 fn draw_quota_cards(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .spacing(1)
         .split(area);
 
@@ -224,16 +220,15 @@ fn draw_quota_cards(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSn
     draw_rate_card(
         frame,
         chunks[0],
-        "weekly left",
-        limits.and_then(|limits| limits.secondary.as_ref()),
+        "5h session left",
+        limits.and_then(|limits| limits.primary.as_ref()),
     );
     draw_rate_card(
         frame,
         chunks[1],
-        "5h left",
-        limits.and_then(|limits| limits.primary.as_ref()),
+        "weekly left",
+        limits.and_then(|limits| limits.secondary.as_ref()),
     );
-    draw_context_card(frame, chunks[2], snapshot);
 }
 
 fn draw_rate_card(
@@ -255,50 +250,12 @@ fn draw_rate_card(
         bar_line(bar_width, remaining, accent),
         Line::from(vec![
             muted(&used_text),
-            muted(" used  reset "),
+            muted(" used  resets "),
             value(&reset, TEXT),
         ]),
     ];
 
     frame.render_widget(Paragraph::new(lines).block(panel(title, accent)), area);
-}
-
-fn draw_context_card(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
-    let latest = snapshot.and_then(|snapshot| snapshot.latest_session.as_ref());
-    let last_total = latest
-        .map(|session| session.last_usage.total_tokens)
-        .unwrap_or_default();
-    let context = latest
-        .and_then(|session| session.context_window)
-        .unwrap_or(0);
-    let used_ratio = if context == 0 {
-        0.0
-    } else {
-        (last_total as f64 / context as f64).clamp(0.0, 1.0)
-    };
-    let remaining = 1.0 - used_ratio;
-    let remaining_tokens = context.saturating_sub(last_total);
-    let accent = remaining_color(remaining);
-    let bar_width = area.width.saturating_sub(6).max(8) as usize;
-
-    let lines = vec![
-        Line::from(vec![
-            value(&format::tokens(remaining_tokens), accent),
-            muted(" headroom"),
-        ]),
-        bar_line(bar_width, remaining, accent),
-        Line::from(vec![
-            muted(&format!("{:.0}% used", used_ratio * 100.0)),
-            muted("  "),
-            value(&format::tokens(context), TEXT),
-            muted(" max"),
-        ]),
-    ];
-
-    frame.render_widget(
-        Paragraph::new(lines).block(panel("context left", accent)),
-        area,
-    );
 }
 
 fn draw_body(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
@@ -315,24 +272,25 @@ fn draw_turn_panel(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSna
     let latest = snapshot.and_then(|snapshot| snapshot.latest_session.as_ref());
     let usage = latest.map(|session| session.last_usage).unwrap_or_default();
     let cache_ratio = cache_ratio(usage);
+    let has_breakdown = format::usage_has_breakdown(usage);
 
     let lines = vec![
         Line::from(vec![
             muted("total "),
             value(&format::tokens(usage.total_tokens), TEAL),
         ]),
-        stat_line("input", usage.input_tokens),
-        stat_line("cached", usage.cached_input_tokens),
-        stat_line("output", usage.output_tokens),
-        stat_line("reasoning", usage.reasoning_output_tokens),
+        stat_line("input", usage.input_tokens, has_breakdown),
+        stat_line("cached", usage.cached_input_tokens, has_breakdown),
+        stat_line("output", usage.output_tokens, has_breakdown),
+        stat_line("reasoning", usage.reasoning_output_tokens, has_breakdown),
         Line::raw(""),
         Line::from(vec![
             muted("cache ratio "),
-            value(&format!("{:.0}%", cache_ratio * 100.0), MINT),
+            value(&ratio_percent(cache_ratio), MINT),
         ]),
         bar_line(
             area.width.saturating_sub(6).max(8) as usize,
-            cache_ratio,
+            cache_ratio.unwrap_or(0.0),
             MINT,
         ),
     ];
@@ -369,25 +327,14 @@ fn draw_recent_panel(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterS
     frame.render_widget(sparkline, rows[0]);
 
     let table = Table::new(recent_rows(snapshot), recent_columns(rows[1].width))
-        .block(panel("recent sessions", SKY))
-        .header(
-            Row::new([
-                Cell::from("updated"),
-                Cell::from("turn"),
-                Cell::from("context"),
-            ])
-            .style(muted_style()),
-        );
+        .block(panel("recent turns", SKY))
+        .header(Row::new([Cell::from("updated"), Cell::from("turn")]).style(muted_style()));
     frame.render_widget(table, rows[1]);
 }
 
 fn recent_rows(snapshot: Option<&MeterSnapshot>) -> Vec<Row<'static>> {
     let Some(snapshot) = snapshot else {
-        return vec![Row::new([
-            Cell::from("--"),
-            Cell::from("--"),
-            Cell::from("--"),
-        ])];
+        return vec![Row::new([Cell::from("--"), Cell::from("--")])];
     };
 
     snapshot
@@ -399,25 +346,16 @@ fn recent_rows(snapshot: Option<&MeterSnapshot>) -> Vec<Row<'static>> {
                 Cell::from(format::age(session.modified_at)).style(Style::default().fg(TEXT)),
                 Cell::from(format::tokens(session.last_usage.total_tokens))
                     .style(Style::default().fg(TEAL)),
-                Cell::from(context_used_text(session)).style(Style::default().fg(MINT)),
             ])
         })
         .collect()
 }
 
-fn recent_columns(width: u16) -> [Constraint; 3] {
+fn recent_columns(width: u16) -> [Constraint; 2] {
     if width < 42 {
-        [
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Length(9),
-        ]
+        [Constraint::Length(8), Constraint::Length(10)]
     } else {
-        [
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
-        ]
+        [Constraint::Length(12), Constraint::Length(12)]
     }
 }
 
@@ -460,12 +398,14 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapsho
     );
 }
 
-fn stat_line(label: &'static str, tokens: u64) -> Line<'static> {
-    Line::from(vec![
-        muted(label),
-        Span::raw(" "),
-        value(&format::tokens(tokens), TEXT),
-    ])
+fn stat_line(label: &'static str, tokens: u64, available: bool) -> Line<'static> {
+    let token_text = if available {
+        format::tokens(tokens)
+    } else {
+        "--".to_string()
+    };
+
+    Line::from(vec![muted(label), Span::raw(" "), value(&token_text, TEXT)])
 }
 
 fn bar_line(width: usize, ratio: f64, accent: Color) -> Line<'static> {
@@ -479,26 +419,18 @@ fn bar_line(width: usize, ratio: f64, accent: Color) -> Line<'static> {
     ])
 }
 
-fn cache_ratio(usage: TokenUsage) -> f64 {
-    if usage.input_tokens == 0 {
-        0.0
+fn cache_ratio(usage: TokenUsage) -> Option<f64> {
+    if !format::usage_has_breakdown(usage) || usage.input_tokens == 0 {
+        None
     } else {
-        (usage.cached_input_tokens as f64 / usage.input_tokens as f64).clamp(0.0, 1.0)
+        Some((usage.cached_input_tokens as f64 / usage.input_tokens as f64).clamp(0.0, 1.0))
     }
 }
 
-fn context_used_text(session: &SessionSummary) -> String {
-    let Some(context_window) = session.context_window else {
-        return "--".to_string();
-    };
-    if context_window == 0 {
-        return "--".to_string();
-    }
-
-    format!(
-        "{:.0}%",
-        (session.last_usage.total_tokens as f64 / context_window as f64).clamp(0.0, 1.0) * 100.0
-    )
+fn ratio_percent(ratio: Option<f64>) -> String {
+    ratio
+        .map(|ratio| format!("{:.0}%", ratio * 100.0))
+        .unwrap_or_else(|| "--".to_string())
 }
 
 fn remaining_ratio(used_percent: Option<f64>) -> f64 {
@@ -590,14 +522,14 @@ mod tests {
 
     #[test]
     fn cache_ratio_handles_empty_input() {
-        assert_eq!(cache_ratio(TokenUsage::default()), 0.0);
+        assert_eq!(cache_ratio(TokenUsage::default()), None);
         assert_eq!(
             cache_ratio(TokenUsage {
                 input_tokens: 100,
                 cached_input_tokens: 75,
                 ..TokenUsage::default()
             }),
-            0.75
+            Some(0.75)
         );
     }
 
@@ -611,19 +543,5 @@ mod tests {
     #[test]
     fn recent_rows_render_missing_snapshot_placeholder() {
         assert_eq!(recent_rows(None).len(), 1);
-    }
-
-    #[test]
-    fn context_used_text_formats_percentage() {
-        let session = SessionSummary {
-            context_window: Some(200),
-            last_usage: TokenUsage {
-                total_tokens: 50,
-                ..TokenUsage::default()
-            },
-            ..SessionSummary::default()
-        };
-
-        assert_eq!(context_used_text(&session), "25%");
     }
 }

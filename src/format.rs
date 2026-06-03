@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::codex::{MeterSnapshot, RateLimits, RateWindow};
+use crate::codex::{MeterSnapshot, RateLimits, RateWindow, TokenUsage};
 
 pub fn plain_summary(snapshot: &MeterSnapshot) -> String {
     let latest = snapshot.latest_session.as_ref();
@@ -11,35 +11,43 @@ pub fn plain_summary(snapshot: &MeterSnapshot) -> String {
         .and_then(|session| session.provider.as_deref())
         .unwrap_or("unknown");
     let last = latest.map(|session| session.last_usage).unwrap_or_default();
+    let plan = snapshot
+        .current_rate_limits
+        .as_ref()
+        .and_then(|limits| limits.plan_type.as_deref())
+        .unwrap_or("unknown");
 
     let mut lines = Vec::new();
     lines.push("codex-meter".to_string());
-    lines.push(format!("home: {}", snapshot.codex_home.display()));
-    lines.push(format!(
-        "sessions: {} scanned / {} available ({} archived)",
-        snapshot.scanned_files, snapshot.available_session_files, snapshot.archived_session_files
-    ));
-    if snapshot.tail_scanned_files > 0 {
+    lines.push(format!("plan: {plan}"));
+    lines.push(format!("model: {model} ({provider})"));
+    if let Some(limits) = &snapshot.current_rate_limits {
+        lines.push(format!("quota: {}", rate_limit_line(limits)));
+    }
+    if usage_has_breakdown(last) {
         lines.push(format!(
-            "bounded scan: {} large logs read from tail",
-            snapshot.tail_scanned_files
+            "latest turn: {} total, {} input, {} output, {} cached",
+            tokens(last.total_tokens),
+            tokens(last.input_tokens),
+            tokens(last.output_tokens),
+            tokens(last.cached_input_tokens)
+        ));
+    } else {
+        lines.push(format!(
+            "latest turn: {} total (breakdown unavailable)",
+            tokens(last.total_tokens)
         ));
     }
-    lines.push(format!("latest model: {model} ({provider})"));
     lines.push(format!(
-        "last turn: {} total, {} input, {} output, {} cached",
-        tokens(last.total_tokens),
-        tokens(last.input_tokens),
-        tokens(last.output_tokens),
-        tokens(last.cached_input_tokens)
-    ));
-    lines.push(format!(
-        "scanned total: {} total tokens",
-        tokens(snapshot.scanned_total_usage.total_tokens)
+        "local logs: {} recent sessions scanned / {} available",
+        snapshot.scanned_files, snapshot.available_session_files
     ));
 
-    if let Some(limits) = &snapshot.current_rate_limits {
-        lines.push(format!("remaining windows: {}", rate_limit_line(limits)));
+    if snapshot.tail_scanned_files > 0 {
+        lines.push(format!(
+            "large logs: {} read from bounded tails",
+            snapshot.tail_scanned_files
+        ));
     }
 
     if snapshot.malformed_lines > 0 {
@@ -61,6 +69,13 @@ pub fn tokens(value: u64) -> String {
     }
 }
 
+pub fn usage_has_breakdown(usage: TokenUsage) -> bool {
+    usage.input_tokens > 0
+        || usage.cached_input_tokens > 0
+        || usage.output_tokens > 0
+        || usage.reasoning_output_tokens > 0
+}
+
 pub fn percent(value: Option<f64>) -> String {
     value
         .map(|value| format!("{:.0}%", value.clamp(0.0, 999.0)))
@@ -78,10 +93,9 @@ pub fn remaining_percent(value: Option<f64>) -> String {
 }
 
 pub fn rate_limit_line(limits: &RateLimits) -> String {
-    let plan = limits.plan_type.as_deref().unwrap_or("unknown plan");
-    let weekly = window_line("weekly left", limits.secondary.as_ref());
     let short = window_line("5h left", limits.primary.as_ref());
-    format!("{plan}; {weekly}; {short}")
+    let weekly = window_line("weekly left", limits.secondary.as_ref());
+    format!("{short}; {weekly}")
 }
 
 pub fn window_line(label: &str, window: Option<&RateWindow>) -> String {
@@ -154,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_weekly_remaining_before_short_window() {
+    fn labels_short_window_remaining_before_weekly() {
         let limits = RateLimits {
             limit_id: Some("codex".to_string()),
             limit_name: None,
@@ -178,7 +192,7 @@ mod tests {
         assert!(line.contains("weekly left 29%"));
         assert!(line.contains("5h left 58%"));
         assert!(line.contains("(71% used)"));
-        assert!(line.find("weekly left").expect("weekly") < line.find("5h left").expect("5h"));
+        assert!(line.find("5h left").expect("5h") < line.find("weekly left").expect("weekly"));
     }
 
     #[test]
@@ -190,5 +204,18 @@ mod tests {
             + 30;
 
         assert_eq!(reset_in(Some(soon)), "<1m");
+    }
+
+    #[test]
+    fn detects_missing_usage_breakdown() {
+        assert!(!usage_has_breakdown(TokenUsage {
+            total_tokens: 20_000,
+            ..TokenUsage::default()
+        }));
+        assert!(usage_has_breakdown(TokenUsage {
+            total_tokens: 20_000,
+            input_tokens: 19_000,
+            ..TokenUsage::default()
+        }));
     }
 }
