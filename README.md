@@ -2,7 +2,7 @@
 
 A lightweight btop-style terminal meter for Codex.
 
-`codex-meter` reads local Codex session JSONL files from `~/.codex` and renders usage, token, session, and rate-limit data in a terminal dashboard. It does not depend on CodexBar and does not spawn the Codex CLI during normal refreshes.
+`codex-meter` reads local Codex session JSONL files from `~/.codex` and renders remaining quota, latest turn size, recent turn size, and context headroom in a terminal dashboard. It does not depend on CodexBar and does not spawn the Codex CLI during normal refreshes.
 
 Large Codex session logs can be gigabytes. To stay responsive, the default scan reads the 8 most recent session files and only a bounded tail window from large files.
 
@@ -61,12 +61,12 @@ codex-meter alias install --bin-dir ~/.local/bin
 - `~/.codex/sessions`
 - `~/.codex/archived_sessions` for counts only
 
-It parses metadata fields such as token usage, rate limits, model, provider, event type, timestamps, and context window. It does not parse or display prompt/response message text.
+It parses metadata fields such as token usage, rate limits, model, provider, timestamps, and context window. It does not parse or display prompt/response message text.
 
 The dashboard presents Codex rate limits as user-facing windows:
 
-- `weekly usage` for the 7-day Codex window
-- `5h usage` for the short rolling window
+- `weekly left` for remaining 7-day Codex quota
+- `5h left` for the short rolling window
 
 ## Development
 

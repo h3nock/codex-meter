@@ -39,7 +39,7 @@ pub fn plain_summary(snapshot: &MeterSnapshot) -> String {
     ));
 
     if let Some(limits) = &snapshot.current_rate_limits {
-        lines.push(format!("usage windows: {}", rate_limit_line(limits)));
+        lines.push(format!("remaining windows: {}", rate_limit_line(limits)));
     }
 
     if snapshot.malformed_lines > 0 {
@@ -71,19 +71,26 @@ pub fn ratio(value: Option<f64>) -> f64 {
     value.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0
 }
 
+pub fn remaining_percent(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.0}%", (100.0 - value.clamp(0.0, 100.0)).max(0.0)))
+        .unwrap_or_else(|| "--".to_string())
+}
+
 pub fn rate_limit_line(limits: &RateLimits) -> String {
     let plan = limits.plan_type.as_deref().unwrap_or("unknown plan");
-    let weekly = window_line("weekly usage", limits.secondary.as_ref());
-    let short = window_line("5h usage", limits.primary.as_ref());
+    let weekly = window_line("weekly left", limits.secondary.as_ref());
+    let short = window_line("5h left", limits.primary.as_ref());
     format!("{plan}; {weekly}; {short}")
 }
 
 pub fn window_line(label: &str, window: Option<&RateWindow>) -> String {
     match window {
         Some(window) => format!(
-            "{label} {} used reset {}",
-            percent(window.used_percent),
-            reset_in(window.resets_at)
+            "{label} {} reset {} ({} used)",
+            remaining_percent(window.used_percent),
+            reset_in(window.resets_at),
+            percent(window.used_percent)
         ),
         None => format!("{label} --"),
     }
@@ -110,6 +117,8 @@ pub fn reset_in(epoch_seconds: Option<u64>) -> String {
         )
     } else if total_minutes >= 60 {
         format!("{}h {}m", total_minutes / 60, total_minutes % 60)
+    } else if total_minutes == 0 {
+        "<1m".to_string()
     } else {
         format!("{total_minutes}m")
     }
@@ -145,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_weekly_usage_before_short_window() {
+    fn labels_weekly_remaining_before_short_window() {
         let limits = RateLimits {
             limit_id: Some("codex".to_string()),
             limit_name: None,
@@ -166,8 +175,20 @@ mod tests {
 
         let line = rate_limit_line(&limits);
 
-        assert!(line.contains("weekly usage 71% used"));
-        assert!(line.contains("5h usage 42% used"));
-        assert!(line.find("weekly usage").expect("weekly") < line.find("5h usage").expect("5h"));
+        assert!(line.contains("weekly left 29%"));
+        assert!(line.contains("5h left 58%"));
+        assert!(line.contains("(71% used)"));
+        assert!(line.find("weekly left").expect("weekly") < line.find("5h left").expect("5h"));
+    }
+
+    #[test]
+    fn reset_in_shows_sub_minute_window() {
+        let soon = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_secs()
+            + 30;
+
+        assert_eq!(reset_in(Some(soon)), "<1m");
     }
 }

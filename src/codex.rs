@@ -25,12 +25,12 @@ pub struct MeterSnapshot {
     pub latest_session: Option<SessionSummary>,
     pub current_rate_limits: Option<RateLimits>,
     pub recent_session_totals: Vec<u64>,
+    pub recent_sessions: Vec<SessionSummary>,
     pub scanned_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionSummary {
-    pub path: PathBuf,
     pub modified_at: Option<SystemTime>,
     pub started_at: Option<String>,
     pub last_event_at: Option<String>,
@@ -167,8 +167,9 @@ pub fn scan_codex_home(codex_home: &Path, max_files: usize) -> AppResult<MeterSn
             .recent_session_totals
             .push(summary.total_usage.total_tokens);
         if snapshot.latest_session.is_none() {
-            snapshot.latest_session = Some(summary);
+            snapshot.latest_session = Some(summary.clone());
         }
+        snapshot.recent_sessions.push(summary);
     }
 
     if let Some(latest) = &mut snapshot.latest_session {
@@ -298,8 +299,7 @@ fn parse_session_file_with_tail_limit(
     if length > tail_bytes {
         parse_session_tail(path, modified_at, file, length, tail_bytes)
     } else {
-        let mut summary =
-            parse_session_reader(path.to_path_buf(), modified_at, BufReader::new(file))?;
+        let mut summary = parse_session_reader(modified_at, BufReader::new(file))?;
         summary.bytes_scanned = length;
         Ok(summary)
     }
@@ -330,23 +330,17 @@ fn parse_session_tail(
     };
 
     let text = String::from_utf8_lossy(lines).into_owned();
-    let mut summary = parse_session_reader(
-        path.to_path_buf(),
-        modified_at,
-        Cursor::new(text.into_bytes()),
-    )?;
+    let mut summary = parse_session_reader(modified_at, Cursor::new(text.into_bytes()))?;
     summary.tail_scanned = true;
     summary.bytes_scanned = length - start;
     Ok(summary)
 }
 
 fn parse_session_reader<R: BufRead>(
-    path: PathBuf,
     modified_at: Option<SystemTime>,
     reader: R,
 ) -> AppResult<SessionSummary> {
     let mut summary = SessionSummary {
-        path,
         modified_at,
         ..SessionSummary::default()
     };
@@ -453,12 +447,8 @@ mod tests {
 {"timestamp":"2026-06-03T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":5,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":12},"total_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":10,"total_tokens":120},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":42.5,"window_minutes":300,"resets_at":1780492992},"secondary":{"used_percent":71.0,"window_minutes":10080,"resets_at":1780846619},"credits":null,"plan_type":"pro","rate_limit_reached_type":null}}}
 "#;
 
-        let summary = parse_session_reader(
-            PathBuf::from("session.jsonl"),
-            Some(UNIX_EPOCH),
-            Cursor::new(input),
-        )
-        .expect("valid fixture");
+        let summary =
+            parse_session_reader(Some(UNIX_EPOCH), Cursor::new(input)).expect("valid fixture");
 
         assert_eq!(summary.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(summary.total_usage.total_tokens, 120);
