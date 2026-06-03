@@ -68,6 +68,7 @@ It parses metadata fields such as token usage, rate limits, model, provider, eve
 ```sh
 cargo fmt --check
 cargo test
+cargo clippy -- -D warnings
 cargo build --release
 ```
 
