@@ -1,6 +1,7 @@
 use std::{
+    collections::BTreeMap,
     io::{self, Stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -15,15 +16,29 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Sparkline, Table},
 };
 
 use crate::{
     cli::DashboardOptions,
-    codex::{MeterSnapshot, RateWindow, SessionSummary, scan_codex_home},
+    codex::{MeterSnapshot, RateWindow, scan_codex_home},
     error::{AppError, AppResult},
     format,
 };
+
+const BG: Color = Color::Rgb(7, 10, 16);
+const PANEL: Color = Color::Rgb(12, 16, 24);
+const BORDER: Color = Color::Rgb(54, 64, 84);
+const BORDER_DIM: Color = Color::Rgb(35, 43, 60);
+const TEXT: Color = Color::Rgb(204, 212, 232);
+const MUTED: Color = Color::Rgb(108, 116, 140);
+const TRACK: Color = Color::Rgb(31, 38, 52);
+const CYAN: Color = Color::Rgb(124, 236, 224);
+const GREEN: Color = Color::Rgb(141, 235, 159);
+const MAGENTA: Color = Color::Rgb(238, 151, 220);
+const BLUE: Color = Color::Rgb(111, 158, 239);
+const AMBER: Color = Color::Rgb(245, 199, 116);
+const RED: Color = Color::Rgb(255, 111, 134);
 
 pub fn run(codex_home: PathBuf, options: DashboardOptions) -> AppResult<()> {
     let mut terminal = TerminalSession::enter()?;
@@ -53,8 +68,10 @@ pub fn run(codex_home: PathBuf, options: DashboardOptions) -> AppResult<()> {
         {
             let event = event::read()
                 .map_err(|source| AppError::io("failed to read terminal event", source))?;
-            if should_quit(event) {
-                break;
+            match input_action(event) {
+                InputAction::Quit => break,
+                InputAction::Refresh => last_scan = Instant::now() - options.refresh,
+                InputAction::None => {}
             }
         }
     }
@@ -62,13 +79,27 @@ pub fn run(codex_home: PathBuf, options: DashboardOptions) -> AppResult<()> {
     Ok(())
 }
 
-fn should_quit(event: Event) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputAction {
+    Quit,
+    Refresh,
+    None,
+}
+
+fn input_action(event: Event) -> InputAction {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
                 || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                InputAction::Quit
+            } else if key.code == KeyCode::Char('r') {
+                InputAction::Refresh
+            } else {
+                InputAction::None
+            }
         }
-        _ => false,
+        _ => InputAction::None,
     }
 }
 
@@ -79,27 +110,24 @@ fn draw(
     options: &DashboardOptions,
 ) {
     let area = frame.area();
-    if area.width < 72 || area.height < 22 {
+    if area.width < 76 || area.height < 22 {
         draw_too_small(frame, area);
         return;
     }
 
     let shell = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .style(Style::default().bg(Color::Rgb(10, 12, 18)))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(BG))
         .title(Line::from(vec![
             Span::styled(
                 " codex",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "-meter ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
             ),
         ]))
         .title_alignment(Alignment::Left);
@@ -109,11 +137,12 @@ fn draw(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(7),
+            Constraint::Length(2),
+            Constraint::Length(5),
             Constraint::Min(8),
-            Constraint::Length(3),
+            Constraint::Length(2),
         ])
+        .spacing(1)
         .split(inner);
 
     draw_header(frame, rows[0], snapshot, error, options);
@@ -123,10 +152,10 @@ fn draw(
 }
 
 fn draw_too_small(frame: &mut Frame<'_>, area: Rect) {
-    let paragraph = Paragraph::new("codex-meter needs at least 72x22")
+    let paragraph = Paragraph::new("codex-meter needs at least 76x22")
         .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::Yellow))
-        .block(Block::default().borders(Borders::ALL));
+        .style(Style::default().fg(AMBER).bg(BG))
+        .block(panel("codex-meter", AMBER));
     frame.render_widget(paragraph, area);
 }
 
@@ -137,96 +166,107 @@ fn draw_header(
     error: Option<&str>,
     options: &DashboardOptions,
 ) {
+    let latest = snapshot.and_then(|snapshot| snapshot.latest_session.as_ref());
+    let model = latest
+        .and_then(|session| session.model.as_deref())
+        .unwrap_or("unknown");
+    let plan = snapshot
+        .and_then(|snapshot| snapshot.current_rate_limits.as_ref())
+        .and_then(|limits| limits.plan_type.as_deref())
+        .unwrap_or("--");
+
     let status = error
         .map(|message| format!("error: {message}"))
         .unwrap_or_else(|| {
             snapshot
                 .map(|snapshot| {
                     format!(
-                        "{} scanned / {} available | refresh {}s",
+                        "{} / {} sessions  |  {} archived  |  refresh {}s",
                         snapshot.scanned_files,
                         snapshot.available_session_files,
+                        snapshot.archived_session_files,
                         options.refresh.as_secs()
                     )
                 })
-                .unwrap_or_else(|| "scanning Codex logs".to_string())
+                .unwrap_or_else(|| "scanning local Codex logs".to_string())
         });
 
-    let latest = snapshot.and_then(|snapshot| snapshot.latest_session.as_ref());
-    let model = latest
-        .and_then(|session| session.model.as_deref())
-        .unwrap_or("unknown model");
-    let plan = snapshot
-        .and_then(|snapshot| snapshot.current_rate_limits.as_ref())
-        .and_then(|limits| limits.plan_type.as_deref())
-        .unwrap_or("unknown plan");
+    let mut identity = vec![muted("model "), value(model, CYAN)];
+    if let Some(provider) = latest.and_then(|session| session.provider.as_deref()) {
+        identity.extend([muted("  provider "), value(provider, TEXT)]);
+    }
+    identity.extend([muted("  plan "), value(plan, GREEN)]);
 
     let lines = vec![
-        Line::from(vec![
-            Span::styled("model ", Style::default().fg(Color::DarkGray)),
-            Span::styled(model, Style::default().fg(Color::LightCyan)),
-            Span::raw("   "),
-            Span::styled("plan ", Style::default().fg(Color::DarkGray)),
-            Span::styled(plan, Style::default().fg(Color::LightGreen)),
-        ]),
+        Line::from(identity),
         Line::from(Span::styled(
             status,
-            Style::default().fg(if error.is_some() {
-                Color::Red
-            } else {
-                Color::Gray
-            }),
+            Style::default().fg(if error.is_some() { RED } else { MUTED }),
         )),
     ];
 
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(BG)), area);
 }
 
 fn draw_meters(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
             Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
         ])
+        .spacing(1)
         .split(area);
 
     let limits = snapshot.and_then(|snapshot| snapshot.current_rate_limits.as_ref());
-    draw_window_gauge(
+    draw_rate_card(
         frame,
         chunks[0],
-        "primary 5h",
+        "primary",
+        "5h",
         limits.and_then(|limits| limits.primary.as_ref()),
-        Color::LightGreen,
+        GREEN,
     );
-    draw_window_gauge(
+    draw_rate_card(
         frame,
         chunks[1],
-        "secondary 7d",
+        "secondary",
+        "7d",
         limits.and_then(|limits| limits.secondary.as_ref()),
-        Color::LightMagenta,
+        MAGENTA,
     );
-    draw_context_gauge(frame, chunks[2], snapshot);
+    draw_context_card(frame, chunks[2], snapshot);
 }
 
-fn draw_window_gauge(
+fn draw_rate_card(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &'static str,
+    window_name: &'static str,
     window: Option<&RateWindow>,
-    color: Color,
+    accent: Color,
 ) {
-    let label = format::window_line(title, window);
-    let gauge = Gauge::default()
-        .block(panel(title))
-        .gauge_style(Style::default().fg(color).bg(Color::Rgb(28, 32, 44)))
-        .ratio(format::ratio(window.and_then(|window| window.used_percent)))
-        .label(label);
-    frame.render_widget(gauge, area);
+    let ratio = format::ratio(window.and_then(|window| window.used_percent));
+    let percent = format::percent(window.and_then(|window| window.used_percent));
+    let reset = format::reset_in(window.and_then(|window| window.resets_at));
+    let bar_width = area.width.saturating_sub(6).max(8) as usize;
+
+    let lines = vec![
+        Line::from(vec![value(&percent, accent), muted(" used")]),
+        bar_line(bar_width, ratio, accent),
+        Line::from(vec![
+            muted("reset "),
+            value(&reset, TEXT),
+            muted("  window "),
+            value(window_name, TEXT),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines).block(panel(title, accent)), area);
 }
 
-fn draw_context_gauge(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
+fn draw_context_card(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
     let latest = snapshot.and_then(|snapshot| snapshot.latest_session.as_ref());
     let last_total = latest
         .map(|session| session.last_usage.total_tokens)
@@ -239,33 +279,27 @@ fn draw_context_gauge(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&Meter
     } else {
         (last_total as f64 / context as f64).clamp(0.0, 1.0)
     };
+    let percent = format!("{:.0}%", ratio * 100.0);
+    let bar_width = area.width.saturating_sub(6).max(8) as usize;
 
-    let label = if context == 0 {
-        "context --".to_string()
-    } else {
-        format!(
-            "last turn {} / {}",
-            format::tokens(last_total),
-            format::tokens(context)
-        )
-    };
+    let lines = vec![
+        Line::from(vec![
+            value(&format::tokens(last_total), BLUE),
+            muted(" / "),
+            value(&format::tokens(context), TEXT),
+        ]),
+        bar_line(bar_width, ratio, BLUE),
+        Line::from(vec![muted("context used "), value(&percent, TEXT)]),
+    ];
 
-    let gauge = Gauge::default()
-        .block(panel("context"))
-        .gauge_style(
-            Style::default()
-                .fg(Color::LightBlue)
-                .bg(Color::Rgb(28, 32, 44)),
-        )
-        .ratio(ratio)
-        .label(label);
-    frame.render_widget(gauge, area);
+    frame.render_widget(Paragraph::new(lines).block(panel("context", BLUE)), area);
 }
 
 fn draw_body(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+        .spacing(1)
         .split(area);
     draw_token_panel(frame, chunks[0], snapshot);
     draw_activity_panel(frame, chunks[1], snapshot);
@@ -277,71 +311,60 @@ fn draw_token_panel(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSn
     let total = snapshot
         .map(|snapshot| snapshot.scanned_total_usage)
         .unwrap_or_default();
+    let content_width = area.width.saturating_sub(6) as usize;
 
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("last turn ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format::tokens(last.total_tokens),
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(format::usage_parts(last).join("   ")),
+        metric_line("last turn", last.total_tokens, CYAN),
+        usage_line("in", last.input_tokens, "cached", last.cached_input_tokens),
+        usage_line(
+            "out",
+            last.output_tokens,
+            "reason",
+            last.reasoning_output_tokens,
+        ),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled("scanned total ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format::tokens(total.total_tokens),
-                Style::default()
-                    .fg(Color::LightGreen)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(format::usage_parts(total).join("   ")),
-        Line::raw(""),
+        metric_line("scanned total", total.total_tokens, GREEN),
+        usage_line(
+            "in",
+            total.input_tokens,
+            "cached",
+            total.cached_input_tokens,
+        ),
+        usage_line(
+            "out",
+            total.output_tokens,
+            "reason",
+            total.reasoning_output_tokens,
+        ),
     ];
 
     if let Some(session) = latest {
-        lines.push(Line::from(vec![
-            Span::styled("latest file ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                session
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unknown"),
-                Style::default().fg(Color::Gray),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("updated ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format::age(session.modified_at),
-                Style::default().fg(Color::Gray),
-            ),
-            Span::raw("   "),
-            Span::styled("scan ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                if session.tail_scanned { "tail" } else { "full" },
-                Style::default().fg(Color::Gray),
-            ),
-        ]));
+        let file = compact_file_name(&session.path, content_width.saturating_sub(7));
+        let scan_mode = if session.tail_scanned {
+            format!("tail {}", bytes(session.bytes_scanned))
+        } else {
+            "full".to_string()
+        };
+        lines.extend([
+            Line::raw(""),
+            Line::from(vec![muted("file "), value(&file, TEXT)]),
+            Line::from(vec![
+                muted("updated "),
+                value(&format::age(session.modified_at), TEXT),
+                muted("  scan "),
+                value(&scan_mode, TEXT),
+            ]),
+        ]);
     }
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel("tokens"))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(panel("tokens", CYAN)), area);
 }
 
 fn draw_activity_panel(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(4)])
+        .constraints([Constraint::Length(5), Constraint::Min(5)])
+        .spacing(1)
         .split(area);
 
     let data = snapshot
@@ -357,21 +380,17 @@ fn draw_activity_panel(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&Mete
         .unwrap_or_else(|| vec![0]);
 
     let sparkline = Sparkline::default()
-        .block(panel("recent session totals"))
-        .style(Style::default().fg(Color::Cyan))
+        .block(panel("recent session totals", GREEN))
+        .style(Style::default().fg(GREEN))
         .data(&data);
     frame.render_widget(sparkline, rows[0]);
 
-    let table_rows = event_rows(snapshot);
     let table = Table::new(
-        table_rows,
-        [Constraint::Percentage(70), Constraint::Percentage(30)],
+        event_rows(snapshot),
+        [Constraint::Min(16), Constraint::Length(8)],
     )
-    .block(panel("events"))
-    .header(
-        Row::new([Cell::from("event"), Cell::from("count")])
-            .style(Style::default().fg(Color::DarkGray)),
-    )
+    .block(panel("events", MAGENTA))
+    .header(Row::new([Cell::from("event"), Cell::from("count")]).style(muted_style()))
     .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(table, rows[1]);
 }
@@ -381,85 +400,192 @@ fn event_rows(snapshot: Option<&MeterSnapshot>) -> Vec<Row<'static>> {
         return vec![Row::new([Cell::from("waiting"), Cell::from("--")])];
     };
 
-    let mut events = snapshot
-        .event_counts
-        .iter()
-        .map(|(event, count)| (event.clone(), *count))
-        .collect::<Vec<_>>();
+    let mut grouped = BTreeMap::new();
+    for (event, count) in &snapshot.event_counts {
+        *grouped.entry(event_label(event).to_string()).or_insert(0) += count;
+    }
+
+    let mut events = grouped.into_iter().collect::<Vec<_>>();
     events.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     events
         .into_iter()
         .take(8)
         .map(|(event, count)| {
             Row::new([
-                Cell::from(event).style(Style::default().fg(Color::Gray)),
-                Cell::from(count.to_string()).style(Style::default().fg(Color::LightGreen)),
+                Cell::from(event).style(Style::default().fg(TEXT)),
+                Cell::from(count.to_string()).style(Style::default().fg(GREEN)),
             ])
         })
         .collect()
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapshot>) {
-    let latest = snapshot.and_then(|snapshot| snapshot.latest_session.as_ref());
     let line = Line::from(vec![
-        Span::styled("q/esc ", Style::default().fg(Color::LightRed)),
-        Span::styled("quit", Style::default().fg(Color::DarkGray)),
-        Span::raw("   "),
-        Span::styled("malformed ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            snapshot
-                .map(|snapshot| snapshot.malformed_lines.to_string())
-                .unwrap_or_else(|| "--".to_string()),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw("   "),
-        Span::styled("tail files ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            snapshot
-                .map(|snapshot| snapshot.tail_scanned_files.to_string())
-                .unwrap_or_else(|| "--".to_string()),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw("   "),
-        Span::styled("scan ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            snapshot
+        key("q"),
+        muted(" quit   "),
+        key("esc"),
+        muted(" close   "),
+        key("r"),
+        muted(" refresh   "),
+        muted("updated "),
+        value(
+            &snapshot
                 .map(|snapshot| format::age(snapshot.scanned_at))
                 .unwrap_or_else(|| "--".to_string()),
-            Style::default().fg(Color::Gray),
+            TEXT,
         ),
-        Span::raw("   "),
-        Span::styled("latest event ", Style::default().fg(Color::DarkGray)),
-        Span::styled(latest_event(latest), Style::default().fg(Color::Gray)),
+        muted("   malformed "),
+        value(
+            &snapshot
+                .map(|snapshot| snapshot.malformed_lines.to_string())
+                .unwrap_or_else(|| "--".to_string()),
+            AMBER,
+        ),
+        muted("   tail "),
+        value(
+            &snapshot
+                .map(|snapshot| snapshot.tail_scanned_files.to_string())
+                .unwrap_or_else(|| "--".to_string()),
+            AMBER,
+        ),
     ]);
 
     frame.render_widget(
-        Paragraph::new(line).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(Color::DarkGray),
-        ),
+        Paragraph::new(line)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(BG))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(BORDER_DIM),
+            ),
         area,
     );
 }
 
-fn latest_event(session: Option<&SessionSummary>) -> String {
-    session
-        .and_then(|session| session.last_event_at.clone())
-        .unwrap_or_else(|| "--".to_string())
+fn metric_line(label: &'static str, tokens: u64, accent: Color) -> Line<'static> {
+    Line::from(vec![
+        muted(label),
+        Span::raw(" "),
+        value(&format::tokens(tokens), accent),
+    ])
 }
 
-fn panel(title: &'static str) -> Block<'static> {
+fn usage_line(
+    left_label: &'static str,
+    left_value: u64,
+    right_label: &'static str,
+    right_value: u64,
+) -> Line<'static> {
+    Line::from(vec![
+        muted(left_label),
+        Span::raw(" "),
+        value(&format::tokens(left_value), TEXT),
+        muted("   "),
+        muted(right_label),
+        Span::raw(" "),
+        value(&format::tokens(right_value), TEXT),
+    ])
+}
+
+fn bar_line(width: usize, ratio: f64, accent: Color) -> Line<'static> {
+    let width = width.clamp(8, 48);
+    let filled = ((width as f64 * ratio).round() as usize).clamp(0, width);
+    let empty = width - filled;
+
+    Line::from(vec![
+        Span::styled("█".repeat(filled), Style::default().fg(accent)),
+        Span::styled("░".repeat(empty), Style::default().fg(TRACK)),
+    ])
+}
+
+fn event_label(event: &str) -> &'static str {
+    match event {
+        "response_item/function_call_output" => "tool output",
+        "response_item/function_call" => "tool calls",
+        "response_item/message" => "assistant text",
+        "response_item/reasoning" => "reasoning",
+        "event_msg/token_count" => "token updates",
+        "event_msg/agent_message" => "agent messages",
+        "event_msg/user_message" => "user messages",
+        "event_msg/mcp_tool_call_end" => "mcp tools",
+        "event_msg/task_complete" => "tasks done",
+        "event_msg/task_started" => "tasks started",
+        "event_msg/context_compacted" => "compactions",
+        "event_msg/patch_apply_end" => "patches",
+        "response_item/custom_tool_call" => "custom tools",
+        "response_item/custom_tool_call_output" => "custom output",
+        "response_item/web_search_call" | "event_msg/web_search_end" => "web search",
+        "session_meta" => "sessions",
+        "turn_context" => "turns",
+        _ => "other",
+    }
+}
+
+fn compact_file_name(path: &Path, max_chars: usize) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    truncate_middle(name, max_chars)
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+
+    let left = (max_chars - 1) / 2;
+    let right = max_chars - 1 - left;
+    let prefix = chars.iter().take(left).collect::<String>();
+    let suffix = chars
+        .iter()
+        .skip(chars.len().saturating_sub(right))
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
+}
+
+fn bytes(value: u64) -> String {
+    if value >= 1024 * 1024 {
+        format!("{:.1} MiB", value as f64 / (1024.0 * 1024.0))
+    } else if value >= 1024 {
+        format!("{:.0} KiB", value as f64 / 1024.0)
+    } else {
+        format!("{value} B")
+    }
+}
+
+fn panel(title: impl Into<String>, accent: Color) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(62, 70, 88)))
-        .style(Style::default().bg(Color::Rgb(14, 17, 25)))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(PANEL))
+        .padding(Padding::horizontal(1))
         .title(Span::styled(
-            format!(" {title} "),
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
+            format!(" {} ", title.into()),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
+}
+
+fn value(text: &str, color: Color) -> Span<'static> {
+    Span::styled(text.to_string(), Style::default().fg(color))
+}
+
+fn muted(text: &str) -> Span<'static> {
+    Span::styled(text.to_string(), muted_style())
+}
+
+fn key(text: &str) -> Span<'static> {
+    Span::styled(text.to_string(), Style::default().fg(RED))
+}
+
+fn muted_style() -> Style {
+    Style::default().fg(MUTED)
 }
 
 fn inset(area: Rect, margin: u16) -> Rect {
@@ -493,5 +619,26 @@ impl Drop for TerminalSession {
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncates_middle_for_long_names() {
+        assert_eq!(truncate_middle("abcdef", 6), "abcdef");
+        assert_eq!(truncate_middle("abcdefghijkl", 7), "abc…jkl");
+    }
+
+    #[test]
+    fn maps_internal_events_to_readable_labels() {
+        assert_eq!(
+            event_label("response_item/function_call_output"),
+            "tool output"
+        );
+        assert_eq!(event_label("event_msg/token_count"), "token updates");
+        assert_eq!(event_label("unknown/raw"), "other");
     }
 }

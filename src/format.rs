@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::codex::{MeterSnapshot, RateLimits, RateWindow, TokenUsage};
+use crate::codex::{MeterSnapshot, RateLimits, RateWindow};
 
 pub fn plain_summary(snapshot: &MeterSnapshot) -> String {
     let latest = snapshot.latest_session.as_ref();
@@ -59,15 +59,6 @@ pub fn tokens(value: u64) -> String {
     } else {
         value.to_string()
     }
-}
-
-pub fn usage_parts(usage: TokenUsage) -> Vec<String> {
-    vec![
-        format!("input {}", tokens(usage.input_tokens)),
-        format!("cached {}", tokens(usage.cached_input_tokens)),
-        format!("output {}", tokens(usage.output_tokens)),
-        format!("reasoning {}", tokens(usage.reasoning_output_tokens)),
-    ]
 }
 
 pub fn percent(value: Option<f64>) -> String {

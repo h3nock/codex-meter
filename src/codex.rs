@@ -131,6 +131,9 @@ pub fn scan_codex_home(codex_home: &Path, max_files: usize) -> AppResult<MeterSn
         scanned_at: Some(SystemTime::now()),
         ..MeterSnapshot::default()
     };
+    let mut fallback_model = None;
+    let mut fallback_provider = None;
+    let mut fallback_context_window = None;
 
     for file in session_files.into_iter().take(max_files) {
         let summary = parse_session_file(&file.path, file.modified_at)?;
@@ -145,8 +148,20 @@ pub fn scan_codex_home(codex_home: &Path, max_files: usize) -> AppResult<MeterSn
             *snapshot.event_counts.entry(event.clone()).or_default() += count;
         }
 
-        if snapshot.current_rate_limits.is_none() {
+        if should_replace_rate_limits(
+            snapshot.current_rate_limits.as_ref(),
+            summary.rate_limits.as_ref(),
+        ) {
             snapshot.current_rate_limits = summary.rate_limits.clone();
+        }
+        if fallback_model.is_none() {
+            fallback_model = summary.model.clone();
+        }
+        if fallback_provider.is_none() {
+            fallback_provider = summary.provider.clone();
+        }
+        if fallback_context_window.is_none() {
+            fallback_context_window = summary.context_window;
         }
         snapshot
             .recent_session_totals
@@ -156,7 +171,66 @@ pub fn scan_codex_home(codex_home: &Path, max_files: usize) -> AppResult<MeterSn
         }
     }
 
+    if let Some(latest) = &mut snapshot.latest_session {
+        if latest.model.is_none() {
+            latest.model = fallback_model;
+        }
+        if latest.provider.is_none() {
+            latest.provider = fallback_provider;
+        }
+        if latest.context_window.is_none() {
+            latest.context_window = fallback_context_window;
+        }
+    }
+
     Ok(snapshot)
+}
+
+fn should_replace_rate_limits(
+    current: Option<&RateLimits>,
+    candidate: Option<&RateLimits>,
+) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+
+    current.is_none_or(|current| rate_limit_score(candidate) > rate_limit_score(current))
+}
+
+fn rate_limit_score(rate_limits: &RateLimits) -> u8 {
+    let mut score = 0;
+    if rate_limits.plan_type.is_some() {
+        score += 3;
+    }
+    if rate_window_has_usage(rate_limits.primary.as_ref()) {
+        score += 2;
+    }
+    if rate_window_has_usage(rate_limits.secondary.as_ref()) {
+        score += 2;
+    }
+    if rate_limits
+        .primary
+        .as_ref()
+        .and_then(|window| window.resets_at)
+        .is_some()
+    {
+        score += 1;
+    }
+    if rate_limits
+        .secondary
+        .as_ref()
+        .and_then(|window| window.resets_at)
+        .is_some()
+    {
+        score += 1;
+    }
+    score
+}
+
+fn rate_window_has_usage(window: Option<&RateWindow>) -> bool {
+    window
+        .and_then(|window| window.used_percent)
+        .is_some_and(|percent| percent > 0.0)
 }
 
 fn collect_jsonl_files(root: &Path) -> AppResult<Vec<SessionFile>> {
@@ -447,6 +521,38 @@ mod tests {
         assert_eq!(snapshot.scanned_files, 2);
         assert_eq!(snapshot.malformed_lines, 1);
         assert_eq!(snapshot.scanned_total_usage.total_tokens, 30);
+
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn scanner_keeps_more_informative_rate_limits() {
+        let root = unique_temp_dir("codex-meter-rate-limits");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions");
+
+        let weak = sessions.join("weak.jsonl");
+        fs::write(
+            &weak,
+            r#"{"timestamp":"2026-06-03T10:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":0.0,"window_minutes":300,"resets_at":1780492992},"secondary":{"used_percent":0.0,"window_minutes":10080,"resets_at":1780846619},"credits":null,"plan_type":null,"rate_limit_reached_type":null}}}"#,
+        )
+        .expect("write weak");
+
+        let strong = sessions.join("strong.jsonl");
+        fs::write(
+            &strong,
+            r#"{"timestamp":"2026-06-03T10:01:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":69.0,"window_minutes":300,"resets_at":1780492992},"secondary":{"used_percent":74.0,"window_minutes":10080,"resets_at":1780846619},"credits":null,"plan_type":"prolite","rate_limit_reached_type":null}}}"#,
+        )
+        .expect("write strong");
+
+        let snapshot = scan_codex_home(&root, 8).expect("scan");
+        let limits = snapshot.current_rate_limits.expect("limits");
+
+        assert_eq!(limits.plan_type.as_deref(), Some("prolite"));
+        assert_eq!(
+            limits.primary.and_then(|window| window.used_percent),
+            Some(69.0)
+        );
 
         fs::remove_dir_all(root).expect("cleanup");
     }
