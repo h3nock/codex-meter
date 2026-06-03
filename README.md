@@ -59,7 +59,6 @@ codex-meter alias install --bin-dir ~/.local/bin
 `codex-meter` scans recent files under:
 
 - `~/.codex/sessions`
-- `~/.codex/archived_sessions` for counts only
 
 It parses metadata fields such as token usage, rate limits, model, provider, and timestamps. It does not parse or display prompt/response message text.
 
