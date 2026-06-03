@@ -63,6 +63,11 @@ codex-meter alias install --bin-dir ~/.local/bin
 
 It parses metadata fields such as token usage, rate limits, model, provider, event type, timestamps, and context window. It does not parse or display prompt/response message text.
 
+The dashboard presents Codex rate limits as user-facing windows:
+
+- `weekly usage` for the 7-day Codex window
+- `5h usage` for the short rolling window
+
 ## Development
 
 ```sh

@@ -223,18 +223,16 @@ fn draw_meters(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&MeterSnapsho
     draw_rate_card(
         frame,
         chunks[0],
-        "primary",
-        "5h",
-        limits.and_then(|limits| limits.primary.as_ref()),
+        "weekly usage",
+        limits.and_then(|limits| limits.secondary.as_ref()),
         GREEN,
     );
     draw_rate_card(
         frame,
         chunks[1],
-        "secondary",
-        "7d",
-        limits.and_then(|limits| limits.secondary.as_ref()),
-        MAGENTA,
+        "5h usage",
+        limits.and_then(|limits| limits.primary.as_ref()),
+        AMBER,
     );
     draw_context_card(frame, chunks[2], snapshot);
 }
@@ -243,7 +241,6 @@ fn draw_rate_card(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &'static str,
-    window_name: &'static str,
     window: Option<&RateWindow>,
     accent: Color,
 ) {
@@ -255,12 +252,7 @@ fn draw_rate_card(
     let lines = vec![
         Line::from(vec![value(&percent, accent), muted(" used")]),
         bar_line(bar_width, ratio, accent),
-        Line::from(vec![
-            muted("reset "),
-            value(&reset, TEXT),
-            muted("  window "),
-            value(window_name, TEXT),
-        ]),
+        Line::from(vec![muted("resets in "), value(&reset, TEXT)]),
     ];
 
     frame.render_widget(Paragraph::new(lines).block(panel(title, accent)), area);

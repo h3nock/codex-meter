@@ -39,7 +39,7 @@ pub fn plain_summary(snapshot: &MeterSnapshot) -> String {
     ));
 
     if let Some(limits) = &snapshot.current_rate_limits {
-        lines.push(format!("rate limits: {}", rate_limit_line(limits)));
+        lines.push(format!("usage windows: {}", rate_limit_line(limits)));
     }
 
     if snapshot.malformed_lines > 0 {
@@ -73,15 +73,15 @@ pub fn ratio(value: Option<f64>) -> f64 {
 
 pub fn rate_limit_line(limits: &RateLimits) -> String {
     let plan = limits.plan_type.as_deref().unwrap_or("unknown plan");
-    let primary = window_line("5h", limits.primary.as_ref());
-    let secondary = window_line("7d", limits.secondary.as_ref());
-    format!("{plan}; {primary}; {secondary}")
+    let weekly = window_line("weekly usage", limits.secondary.as_ref());
+    let short = window_line("5h usage", limits.primary.as_ref());
+    format!("{plan}; {weekly}; {short}")
 }
 
 pub fn window_line(label: &str, window: Option<&RateWindow>) -> String {
     match window {
         Some(window) => format!(
-            "{label} {} reset {}",
+            "{label} {} used reset {}",
             percent(window.used_percent),
             reset_in(window.resets_at)
         ),
@@ -142,5 +142,32 @@ mod tests {
         assert_eq!(tokens(999), "999");
         assert_eq!(tokens(1_200), "1.2K");
         assert_eq!(tokens(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn labels_weekly_usage_before_short_window() {
+        let limits = RateLimits {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            plan_type: Some("pro".to_string()),
+            primary: Some(RateWindow {
+                used_percent: Some(42.0),
+                window_minutes: Some(300),
+                resets_at: None,
+            }),
+            secondary: Some(RateWindow {
+                used_percent: Some(71.0),
+                window_minutes: Some(10080),
+                resets_at: None,
+            }),
+            credits: None,
+            rate_limit_reached_type: None,
+        };
+
+        let line = rate_limit_line(&limits);
+
+        assert!(line.contains("weekly usage 71% used"));
+        assert!(line.contains("5h usage 42% used"));
+        assert!(line.find("weekly usage").expect("weekly") < line.find("5h usage").expect("5h"));
     }
 }
