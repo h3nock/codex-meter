@@ -39,7 +39,7 @@ fn run() -> AppResult<()> {
             ui::run(codex_home, options)
         }
         Command::Alias(AliasCommand::Status) => alias::print_status(),
-        Command::Alias(AliasCommand::Install { bin_dir }) => alias::install(bin_dir),
+        Command::Alias(AliasCommand::Create { bin_dir }) => alias::create(bin_dir),
         Command::Help => {
             println!("{}", cli::HELP);
             Ok(())

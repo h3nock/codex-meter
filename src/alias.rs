@@ -20,7 +20,7 @@ pub fn print_status() -> AppResult<()> {
     }
 }
 
-pub fn install(bin_dir: Option<PathBuf>) -> AppResult<()> {
+pub fn create(bin_dir: Option<PathBuf>) -> AppResult<()> {
     let target = env::current_exe()
         .map_err(|source| AppError::io("failed to locate current executable", source))?;
     let bin_dir = match bin_dir {
@@ -39,7 +39,7 @@ pub fn install(bin_dir: Option<PathBuf>) -> AppResult<()> {
     validate_alias_destination(&target, &destination)?;
 
     create_symlink(&target, &destination)?;
-    println!("installed cm -> {}", target.display());
+    println!("created cm -> {}", target.display());
     Ok(())
 }
 
@@ -108,7 +108,7 @@ fn create_symlink(target: &Path, destination: &Path) -> AppResult<()> {
     std::os::unix::fs::symlink(target, destination).map_err(|source| {
         AppError::io(
             format!(
-                "failed to create symlink {} -> {}",
+                "failed to create alias {} -> {}",
                 destination.display(),
                 target.display()
             ),
@@ -120,7 +120,7 @@ fn create_symlink(target: &Path, destination: &Path) -> AppResult<()> {
 #[cfg(not(unix))]
 fn create_symlink(_: &Path, _: &Path) -> AppResult<()> {
     Err(AppError::Alias(
-        "alias install currently supports Unix-like systems only".to_string(),
+        "alias create currently supports Unix-like systems only".to_string(),
     ))
 }
 
@@ -129,6 +129,7 @@ mod tests {
     use std::{
         ffi::OsString,
         fs,
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 

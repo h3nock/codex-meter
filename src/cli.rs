@@ -9,7 +9,7 @@ Usage:
   codex-meter [--codex-home PATH] [--refresh SECONDS] [--max-files N]
   codex-meter --once [--codex-home PATH] [--max-files N]
   codex-meter alias status
-  codex-meter alias install [--bin-dir PATH]
+  codex-meter alias create [--bin-dir PATH]
 
 Options:
   --codex-home PATH   Codex home directory. Defaults to CODEX_HOME or ~/.codex.
@@ -20,7 +20,7 @@ Options:
   -V, --version       Show the version.
 
 The short command name `cm` is not installed by default. Use
-`codex-meter alias install` to create it only when it does not collide.
+`codex-meter alias create` to create it only when it does not collide.
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub struct DashboardOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AliasCommand {
     Status,
-    Install { bin_dir: Option<PathBuf> },
+    Create { bin_dir: Option<PathBuf> },
 }
 
 impl Default for DashboardOptions {
@@ -134,7 +134,7 @@ fn parse_dashboard(args: &[OsString]) -> AppResult<Command> {
 fn parse_alias(args: &[OsString]) -> AppResult<Command> {
     let Some(action) = args.first() else {
         return Err(AppError::Argument(
-            "missing alias action; use `codex-meter alias status` or `codex-meter alias install`"
+            "missing alias action; use `codex-meter alias status` or `codex-meter alias create`"
                 .to_string(),
         ));
     };
@@ -148,7 +148,7 @@ fn parse_alias(args: &[OsString]) -> AppResult<Command> {
             }
             Ok(Command::Alias(AliasCommand::Status))
         }
-        "install" => {
+        "create" => {
             let mut bin_dir = None;
             let mut index = 1;
             while index < args.len() {
@@ -159,16 +159,16 @@ fn parse_alias(args: &[OsString]) -> AppResult<Command> {
                     }
                     value => {
                         return Err(AppError::Argument(format!(
-                            "unknown alias install argument `{value}`"
+                            "unknown alias create argument `{value}`"
                         )));
                     }
                 }
                 index += 1;
             }
-            Ok(Command::Alias(AliasCommand::Install { bin_dir }))
+            Ok(Command::Alias(AliasCommand::Create { bin_dir }))
         }
         value => Err(AppError::Argument(format!(
-            "unknown alias action `{value}`; use status or install"
+            "unknown alias action `{value}`; use status or create"
         ))),
     }
 }
@@ -254,11 +254,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_alias_install_bin_dir() {
-        let parsed = parse_args(["alias", "install", "--bin-dir", "/tmp/bin"]).expect("valid args");
+    fn parses_alias_create_bin_dir() {
+        let parsed = parse_args(["alias", "create", "--bin-dir", "/tmp/bin"]).expect("valid args");
         assert_eq!(
             parsed,
-            Command::Alias(AliasCommand::Install {
+            Command::Alias(AliasCommand::Create {
                 bin_dir: Some(PathBuf::from("/tmp/bin")),
             })
         );
