@@ -15,7 +15,10 @@ pub enum AppError {
         context: String,
         source: serde_json::Error,
     },
-    Terminal(String),
+    Sqlite {
+        context: String,
+        source: rusqlite::Error,
+    },
 }
 
 impl AppError {
@@ -32,6 +35,13 @@ impl AppError {
             source,
         }
     }
+
+    pub fn sqlite(context: impl Into<String>, source: rusqlite::Error) -> Self {
+        Self::Sqlite {
+            context: context.into(),
+            source,
+        }
+    }
 }
 
 impl fmt::Display for AppError {
@@ -44,7 +54,7 @@ impl fmt::Display for AppError {
             }
             Self::Io { context, source } => write!(formatter, "{context}: {source}"),
             Self::Json { context, source } => write!(formatter, "{context}: {source}"),
-            Self::Terminal(message) => write!(formatter, "{message}"),
+            Self::Sqlite { context, source } => write!(formatter, "{context}: {source}"),
         }
     }
 }
@@ -54,6 +64,7 @@ impl std::error::Error for AppError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
+            Self::Sqlite { source, .. } => Some(source),
             _ => None,
         }
     }
