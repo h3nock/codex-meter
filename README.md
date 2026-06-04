@@ -1,78 +1,89 @@
 # codex-meter
 
-A lightweight btop-style terminal meter for Codex.
+`codex-meter` is a lightweight terminal dashboard for Codex usage.
 
-`codex-meter` reads local Codex session JSONL files from `~/.codex` and renders the Codex quota windows, reset timing, latest turn size, and recent turn sizes in a terminal dashboard. It does not depend on CodexBar and does not spawn the Codex CLI during normal refreshes.
+It shows remaining quota, reset timing, token volume, estimated cost, and activity history using Codex account data and local Codex session data.
 
-Large Codex session logs can be gigabytes. To stay responsive, the default scan reads the 8 most recent session files and only a bounded tail window from large files.
+## Features
+
+- Session and weekly quota remaining
+- Reset timing and pace status
+- Latest day and 30-day token totals
+- Estimated latest day and 30-day cost
+- Top model
+- Token activity calendar
+- Used days, current streak, and longest streak
+
+## Requirements
+
+- macOS
+- Codex signed in on the same machine
 
 ## Install
 
-From this repository:
+### Homebrew
+
+```sh
+brew install h3nock/tap/codex-meter
+```
+
+### GitHub Releases
+
+Download the latest macOS archive from the releases page:
+
+```text
+https://github.com/h3nock/codex-meter/releases/latest
+```
+
+Extract it and move the binary somewhere on your `PATH`:
+
+```sh
+mkdir -p ~/.local/bin
+tar -xzf codex-meter-v*-macos-*.tar.gz
+install -m 0755 codex-meter ~/.local/bin/codex-meter
+```
+
+### From Source
+
+Requires Rust and Cargo.
+
+```sh
+cargo install --git https://github.com/h3nock/codex-meter
+```
+
+From a local checkout:
 
 ```sh
 cargo install --path .
 ```
 
-Run the dashboard:
+## Usage
 
 ```sh
-codex-meter
+codex-meter                         # open the dashboard
+codex-meter --once                  # print one snapshot and exit
+codex-meter --codex-home PATH       # use a different Codex home
+codex-meter alias status            # check whether cm is available
+codex-meter alias create            # create cm next to codex-meter
+codex-meter alias create --bin-dir PATH  # create cm in a custom bin directory
 ```
 
-Print one snapshot and exit:
+Aliases refuse to overwrite another command.
 
-```sh
-codex-meter --once
-```
+## Data and Accuracy
 
-Use a custom Codex home:
+`codex-meter` reads Codex auth and session data under `~/.codex`. Quota and activity are fetched from your Codex account. Token volume and cost are computed from local Codex session data.
 
-```sh
-codex-meter --codex-home ~/.codex --max-files 8 --refresh 2
-```
+Cost is an estimate. Unknown models are left unpriced.
 
-## Short alias
-
-The canonical command is `codex-meter`.
-
-The shorter `cm` command is opt-in because short executable names collide with third-party tools. Check the current PATH:
-
-```sh
-codex-meter alias status
-```
-
-Install `cm` only when it is available:
-
-```sh
-codex-meter alias install
-```
-
-The installer refuses to overwrite another command. By default it creates the alias next to the running `codex-meter` executable. To place it somewhere else:
-
-```sh
-codex-meter alias install --bin-dir ~/.local/bin
-```
-
-## What It Reads
-
-`codex-meter` scans recent files under:
-
-- `~/.codex/sessions`
-
-It parses metadata fields such as token usage, rate limits, model, provider, and timestamps. It does not parse or display prompt/response message text.
-
-The dashboard presents Codex rate limits as user-facing windows:
-
-- `5h session left` for the short rolling Codex window
-- `weekly left` for remaining 7-day Codex quota
+`codex-meter` does not write auth files, refresh tokens, parse prompt/response text, or display account identifiers.
 
 ## Development
 
 ```sh
 cargo fmt --check
 cargo test
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
