@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::codex::{MeterSnapshot, RateLimits, RateWindow, TokenUsage};
+use crate::codex::{MeterSnapshot, RateWindow};
 
 pub fn plain_summary(snapshot: &MeterSnapshot) -> String {
     let latest = snapshot.latest_session.as_ref();
@@ -10,51 +10,114 @@ pub fn plain_summary(snapshot: &MeterSnapshot) -> String {
     let provider = latest
         .and_then(|session| session.provider.as_deref())
         .unwrap_or("unknown");
-    let last = latest.map(|session| session.last_usage).unwrap_or_default();
     let plan = snapshot
         .current_rate_limits
         .as_ref()
         .and_then(|limits| limits.plan_type.as_deref())
-        .unwrap_or("unknown");
+        .and_then(plan_display_name)
+        .unwrap_or_else(|| "unknown".to_string());
 
     let mut lines = Vec::new();
     lines.push("codex-meter".to_string());
     lines.push(format!("plan: {plan}"));
-    lines.push(format!("model: {model} ({provider})"));
+    lines.push(format!("latest model: {model} ({provider})"));
     if let Some(limits) = &snapshot.current_rate_limits {
-        lines.push(format!("quota: {}", rate_limit_line(limits)));
+        if let Some(primary) = limits.primary.as_ref() {
+            lines.push(format!("session: {}", window_line("left", Some(primary))));
+        }
+        if let Some(secondary) = limits.secondary.as_ref() {
+            lines.push(format!("weekly: {}", window_line("left", Some(secondary))));
+        }
     }
-    if usage_has_breakdown(last) {
+    lines.push(format!(
+        "usage: latest day {} / {}, 30d {} / {}",
+        money(snapshot.profile.today_cost_usd),
+        tokens(snapshot.profile.today_tokens),
+        money(snapshot.profile.last_30_days_cost_usd),
+        tokens(snapshot.profile.last_30_days_tokens)
+    ));
+    lines.push(format!(
+        "activity: {} {} tokens, {} 30d tokens, {} used days, {}d current streak, {}d longest streak",
+        tokens(snapshot.profile.activity_total_tokens),
+        snapshot.profile.activity_source.total_label(),
+        tokens(snapshot.profile.activity_last_30_days_tokens),
+        snapshot.profile.active_days,
+        snapshot.profile.current_streak_days,
+        snapshot.profile.longest_streak_days
+    ));
+    if let Some(peak_day_tokens) = snapshot.profile.peak_day_tokens {
+        lines.push(format!("peak day: {}", tokens(peak_day_tokens)));
+    }
+    if let Some(longest_task_seconds) = snapshot.profile.longest_task_seconds {
         lines.push(format!(
-            "latest turn: {} total, {} input, {} output, {} cached",
-            tokens(last.total_tokens),
-            tokens(last.input_tokens),
-            tokens(last.output_tokens),
-            tokens(last.cached_input_tokens)
-        ));
-    } else {
-        lines.push(format!(
-            "latest turn: {} total (breakdown unavailable)",
-            tokens(last.total_tokens)
+            "longest task: {}",
+            duration(Some(longest_task_seconds))
         ));
     }
     lines.push(format!(
-        "local logs: {} recent sessions scanned / {} available",
-        snapshot.scanned_files, snapshot.available_session_files
+        "activity source: {}",
+        snapshot.profile.activity_source.label()
     ));
-
-    if snapshot.tail_scanned_files > 0 {
+    lines.push(format!(
+        "cost source: {}",
+        snapshot
+            .profile
+            .cost_source
+            .as_deref()
+            .unwrap_or("unavailable")
+    ));
+    if snapshot.profile.unpriced_tokens > 0 {
         lines.push(format!(
-            "large logs: {} read from bounded tails",
-            snapshot.tail_scanned_files
+            "unpriced billing tokens: {}",
+            tokens(snapshot.profile.unpriced_tokens)
         ));
     }
-
     if snapshot.malformed_lines > 0 {
         lines.push(format!("malformed lines: {}", snapshot.malformed_lines));
     }
+    if !snapshot.data_warnings.is_empty() {
+        lines.push(format!(
+            "data warnings: {}",
+            snapshot.data_warnings.join("; ")
+        ));
+    }
 
     lines.join("\n")
+}
+
+pub fn plan_display_name(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    match raw.to_ascii_lowercase().as_str() {
+        "pro" => Some("Pro 20x".to_string()),
+        "prolite" | "pro_lite" | "pro-lite" | "pro lite" => Some("Pro 5x".to_string()),
+        _ => Some(
+            raw.split(['_', '-', ' '])
+                .filter(|part| !part.is_empty())
+                .map(title_word)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    }
+}
+
+fn title_word(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    if matches!(lower.as_str(), "cbp" | "k12") {
+        return lower.to_ascii_uppercase();
+    }
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => format!(
+            "{}{}",
+            first.to_uppercase(),
+            chars.as_str().to_ascii_lowercase()
+        ),
+        None => String::new(),
+    }
 }
 
 pub fn tokens(value: u64) -> String {
@@ -69,17 +132,46 @@ pub fn tokens(value: u64) -> String {
     }
 }
 
-pub fn usage_has_breakdown(usage: TokenUsage) -> bool {
-    usage.input_tokens > 0
-        || usage.cached_input_tokens > 0
-        || usage.output_tokens > 0
-        || usage.reasoning_output_tokens > 0
+pub fn money(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value >= 1_000.0 => {
+            let cents = (value * 100.0).round() as u64;
+            format!("${}.{:02}", grouped(cents / 100), cents % 100)
+        }
+        Some(value) if value >= 100.0 => format!("${value:.2}"),
+        Some(value) if value >= 1.0 => format!("${value:.2}"),
+        Some(value) if value > 0.0 => format!("${value:.4}"),
+        Some(_) => "$0".to_string(),
+        None => "$--".to_string(),
+    }
 }
 
-pub fn percent(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{:.0}%", value.clamp(0.0, 999.0)))
-        .unwrap_or_else(|| "--".to_string())
+fn grouped(value: u64) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (index, ch) in raw.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+pub fn duration(value: Option<u64>) -> String {
+    let Some(seconds) = value else {
+        return "--".to_string();
+    };
+    let minutes = seconds / 60;
+    if minutes >= 24 * 60 {
+        format!("{}d {}h", minutes / (24 * 60), (minutes / 60) % 24)
+    } else if minutes >= 60 {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "<1m".to_string()
+    }
 }
 
 pub fn ratio(value: Option<f64>) -> f64 {
@@ -92,19 +184,12 @@ pub fn remaining_percent(value: Option<f64>) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
-pub fn rate_limit_line(limits: &RateLimits) -> String {
-    let short = window_line("5h left", limits.primary.as_ref());
-    let weekly = window_line("weekly left", limits.secondary.as_ref());
-    format!("{short}; {weekly}")
-}
-
 pub fn window_line(label: &str, window: Option<&RateWindow>) -> String {
     match window {
         Some(window) => format!(
-            "{label} {} reset {} ({} used)",
+            "{} {label}, resets {}",
             remaining_percent(window.used_percent),
-            reset_in(window.resets_at),
-            percent(window.used_percent)
+            reset_in(window.resets_at)
         ),
         None => format!("{label} --"),
     }
@@ -168,31 +253,13 @@ mod tests {
     }
 
     #[test]
-    fn labels_short_window_remaining_before_weekly() {
-        let limits = RateLimits {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            plan_type: Some("pro".to_string()),
-            primary: Some(RateWindow {
-                used_percent: Some(42.0),
-                window_minutes: Some(300),
-                resets_at: None,
-            }),
-            secondary: Some(RateWindow {
-                used_percent: Some(71.0),
-                window_minutes: Some(10080),
-                resets_at: None,
-            }),
-            credits: None,
-            rate_limit_reached_type: None,
-        };
-
-        let line = rate_limit_line(&limits);
-
-        assert!(line.contains("weekly left 29%"));
-        assert!(line.contains("5h left 58%"));
-        assert!(line.contains("(71% used)"));
-        assert!(line.find("5h left").expect("5h") < line.find("weekly left").expect("weekly"));
+    fn maps_codex_plan_names() {
+        assert_eq!(plan_display_name("pro").as_deref(), Some("Pro 20x"));
+        assert_eq!(plan_display_name("prolite").as_deref(), Some("Pro 5x"));
+        assert_eq!(
+            plan_display_name("enterprise_cbp_usage_based").as_deref(),
+            Some("Enterprise CBP Usage Based")
+        );
     }
 
     #[test]
@@ -207,15 +274,8 @@ mod tests {
     }
 
     #[test]
-    fn detects_missing_usage_breakdown() {
-        assert!(!usage_has_breakdown(TokenUsage {
-            total_tokens: 20_000,
-            ..TokenUsage::default()
-        }));
-        assert!(usage_has_breakdown(TokenUsage {
-            total_tokens: 20_000,
-            input_tokens: 19_000,
-            ..TokenUsage::default()
-        }));
+    fn formats_large_money_with_grouping() {
+        assert_eq!(money(Some(405.386)), "$405.39");
+        assert_eq!(money(Some(25_713.039)), "$25,713.04");
     }
 }

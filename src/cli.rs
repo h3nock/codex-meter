@@ -13,8 +13,8 @@ Usage:
 
 Options:
   --codex-home PATH   Codex home directory. Defaults to CODEX_HOME or ~/.codex.
-  --refresh SECONDS   TUI refresh interval. Defaults to 2 seconds.
-  --max-files N       Maximum recent session logs to scan per refresh. Defaults to 8.
+  --refresh SECONDS   TUI refresh interval. Defaults to 60 seconds.
+  --max-files N       Session files used for live quota/model metadata. Defaults to 8.
   --once              Print one plain-text snapshot and exit.
   -h, --help          Show this help.
   -V, --version       Show the version.
@@ -49,7 +49,7 @@ impl Default for DashboardOptions {
     fn default() -> Self {
         Self {
             codex_home: None,
-            refresh: Duration::from_secs(2),
+            refresh: Duration::from_secs(60),
             max_files: 8,
             once: false,
         }
@@ -241,6 +241,16 @@ mod tests {
     fn rejects_zero_refresh() {
         let error = parse_args(["--refresh", "0"]).expect_err("zero refresh is invalid");
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn default_refresh_is_one_minute() {
+        let parsed = parse_args(std::iter::empty::<&str>()).expect("valid default args");
+        let Command::Dashboard(options) = parsed else {
+            panic!("expected dashboard command");
+        };
+
+        assert_eq!(options.refresh, Duration::from_secs(60));
     }
 
     #[test]

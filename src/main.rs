@@ -1,15 +1,22 @@
 mod alias;
+mod calendar;
 mod cli;
 mod codex;
+mod cost_estimate;
 mod error;
 mod format;
+mod pricing;
+mod profile;
+mod remote_usage;
+mod render;
+mod state_db;
 mod ui;
 
 use std::process;
 
 use cli::{AliasCommand, Command};
 use codex::scan_codex_home;
-use error::{AppError, AppResult};
+use error::AppResult;
 
 fn main() {
     if let Err(error) = run() {
@@ -41,11 +48,5 @@ fn run() -> AppResult<()> {
             println!("codex-meter {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-    }
-}
-
-impl From<AppError> for process::ExitCode {
-    fn from(_: AppError) -> Self {
-        process::ExitCode::FAILURE
     }
 }
