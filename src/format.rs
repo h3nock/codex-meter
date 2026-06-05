@@ -30,7 +30,7 @@ pub fn plain_summary(snapshot: &MeterSnapshot) -> String {
         }
     }
     lines.push(format!(
-        "usage: latest day {} / {}, 30d {} / {}",
+        "usage: today {} / {}, 30d {} / {}",
         money(snapshot.profile.today_cost_usd),
         tokens(snapshot.profile.today_tokens),
         money(snapshot.profile.last_30_days_cost_usd),

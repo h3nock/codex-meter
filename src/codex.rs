@@ -3,13 +3,16 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    calendar::{date_days, date_from_timestamp},
+    calendar::{
+        date_days, is_date_label, local_date_from_timestamp, local_day_from_system_time,
+        local_today_days,
+    },
     cost_estimate::{CostEstimateResult, CostEstimator},
     error::{AppError, AppResult},
     profile::{UsageProfile, build_usage_profile},
@@ -362,11 +365,7 @@ fn rate_window_has_usage(window: Option<&RateWindow>) -> bool {
 }
 
 fn billing_cutoff_day() -> i64 {
-    SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| (duration.as_secs() / 86_400) as i64)
-        .unwrap_or(0)
-        .saturating_sub(29)
+    local_today_days().saturating_sub(29)
 }
 
 fn collect_jsonl_files(root: &Path) -> AppResult<Vec<SessionFile>> {
@@ -394,7 +393,6 @@ fn collect_cost_threads(codex_home: &Path, cutoff_day: i64) -> AppResult<Vec<Cos
     let mut seen_paths = HashSet::new();
     let mut threads = Vec::new();
     let scan_start_day = cutoff_day.saturating_sub(1);
-    let cutoff_secs = cutoff_day.saturating_mul(86_400);
 
     for file in collect_session_files(codex_home)? {
         let date_recent = file
@@ -404,10 +402,8 @@ fn collect_cost_threads(codex_home: &Path, cutoff_day: i64) -> AppResult<Vec<Cos
             .is_some_and(|days| days >= scan_start_day);
         let modified_recent = file
             .modified_at
-            .and_then(system_time_secs)
-            .is_some_and(|seconds| {
-                i64::try_from(seconds).is_ok_and(|seconds| seconds >= cutoff_secs)
-            });
+            .and_then(local_day_from_system_time)
+            .is_some_and(|days| days >= scan_start_day);
         if !date_recent
             && !modified_recent
             && file.session_date.is_some()
@@ -460,7 +456,7 @@ fn session_file_date(path: &Path) -> Option<String> {
     filename
         .strip_prefix("rollout-")
         .and_then(|rest| rest.get(0..10))
-        .filter(|date| date_from_timestamp(&format!("{date}T00:00:00Z")).is_some())
+        .filter(|date| is_date_label(date))
         .map(ToOwned::to_owned)
 }
 
@@ -470,12 +466,6 @@ fn is_year(value: &str) -> bool {
 
 fn is_month_or_day(value: &str) -> bool {
     value.len() == 2 && value.as_bytes().iter().all(u8::is_ascii_digit)
-}
-
-fn system_time_secs(time: SystemTime) -> Option<u64> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_secs())
 }
 
 fn collect_jsonl_files_inner(root: &Path, files: &mut Vec<SessionFile>) -> AppResult<()> {
@@ -600,12 +590,9 @@ fn apply_entry(summary: &mut SessionSummary, state: &mut SessionParseState, entr
     let entry_date = entry
         .timestamp
         .as_deref()
-        .and_then(date_from_timestamp)
-        .map(ToOwned::to_owned);
-    if let Some(timestamp) = entry.timestamp
-        && let Some(date) = date_from_timestamp(&timestamp)
-    {
-        summary.activity_date = Some(date.to_string());
+        .and_then(local_date_from_timestamp);
+    if let Some(date) = &entry_date {
+        summary.activity_date = Some(date.clone());
     }
 
     let entry_kind = entry.kind;
@@ -808,7 +795,7 @@ mod tests {
         assert_eq!(
             summary.daily_usage,
             vec![SessionDayUsage {
-                date: "2026-06-03".to_string(),
+                date: expected_local_date("2026-06-03T10:00:01Z"),
                 usage: TokenUsage {
                     input_tokens: 10,
                     cached_input_tokens: 5,
@@ -831,8 +818,8 @@ mod tests {
     #[test]
     fn records_daily_usage_inside_multi_day_session() {
         let input = r#"
-{"timestamp":"2026-06-01T23:58:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":10}}}}
-{"timestamp":"2026-06-02T00:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":20}}}}
+{"timestamp":"2026-06-01T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":10}}}}
+{"timestamp":"2026-06-02T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":20}}}}
 "#;
 
         let summary =
@@ -842,20 +829,43 @@ mod tests {
             summary.daily_usage,
             vec![
                 SessionDayUsage {
-                    date: "2026-06-01".to_string(),
+                    date: expected_local_date("2026-06-01T12:00:00Z"),
                     usage: TokenUsage {
                         total_tokens: 10,
                         ..TokenUsage::default()
                     },
                 },
                 SessionDayUsage {
-                    date: "2026-06-02".to_string(),
+                    date: expected_local_date("2026-06-02T12:00:00Z"),
                     usage: TokenUsage {
                         total_tokens: 20,
                         ..TokenUsage::default()
                     },
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn records_session_usage_by_machine_local_date() {
+        let timestamp = "2026-06-05T00:10:00Z";
+        let expected_date = expected_local_date(timestamp);
+        let input = format!(
+            "{{\"timestamp\":\"{timestamp}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"total_tokens\":10}}}}}}}}\n"
+        );
+
+        let summary =
+            parse_session_reader(Some(UNIX_EPOCH), Cursor::new(input)).expect("valid fixture");
+
+        assert_eq!(
+            summary.daily_usage,
+            vec![SessionDayUsage {
+                date: expected_date,
+                usage: TokenUsage {
+                    total_tokens: 10,
+                    ..TokenUsage::default()
+                },
+            }]
         );
     }
 
@@ -982,12 +992,12 @@ mod tests {
     #[test]
     fn cost_estimate_scans_jsonl_without_state_db() {
         let root = unique_temp_dir("codex-meter-cost-jsonl");
-        let date = current_test_date();
+        let (timestamp, date) = current_test_timestamp_and_date();
         let sessions = dated_session_dir(&root, &date);
         fs::create_dir_all(&sessions).expect("create sessions");
         fs::write(
             sessions.join("live.jsonl"),
-            session_cost_fixture(&date, "standalone-session", 1_000, 100, 200),
+            session_cost_fixture(&timestamp, "standalone-session", 1_000, 100, 200),
         )
         .expect("write session");
 
@@ -1018,17 +1028,17 @@ mod tests {
     #[test]
     fn cost_estimate_deduplicates_session_meta_ids() {
         let root = unique_temp_dir("codex-meter-cost-dedupe");
-        let date = current_test_date();
+        let (timestamp, date) = current_test_timestamp_and_date();
         let sessions = dated_session_dir(&root, &date);
         fs::create_dir_all(&sessions).expect("create sessions");
         fs::write(
             sessions.join("one.jsonl"),
-            session_cost_fixture(&date, "same-session", 1_000, 100, 200),
+            session_cost_fixture(&timestamp, "same-session", 1_000, 100, 200),
         )
         .expect("write one");
         fs::write(
             sessions.join("two.jsonl"),
-            session_cost_fixture(&date, "same-session", 1_000, 100, 200),
+            session_cost_fixture(&timestamp, "same-session", 1_000, 100, 200),
         )
         .expect("write two");
 
@@ -1109,13 +1119,10 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{nanos}"))
     }
 
-    fn current_test_date() -> String {
-        let today = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_secs()
-            / 86_400;
-        crate::calendar::date_string_from_days(today as i64)
+    fn current_test_timestamp_and_date() -> (String, String) {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let date = expected_local_date(&timestamp);
+        (timestamp, date)
     }
 
     fn dated_session_dir(root: &Path, date: &str) -> PathBuf {
@@ -1126,7 +1133,7 @@ mod tests {
     }
 
     fn session_cost_fixture(
-        date: &str,
+        timestamp: &str,
         session_id: &str,
         input_tokens: u64,
         cached_input_tokens: u64,
@@ -1134,9 +1141,18 @@ mod tests {
     ) -> String {
         format!(
             "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{session_id}\"}}}}\n\
-             {{\"timestamp\":\"{date}T10:00:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\"}}}}\n\
-             {{\"timestamp\":\"{date}T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":{input_tokens},\"cached_input_tokens\":{cached_input_tokens},\"output_tokens\":{output_tokens},\"total_tokens\":{}}}}}}}}}\n",
+             {{\"timestamp\":\"{timestamp}\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\"}}}}\n\
+             {{\"timestamp\":\"{timestamp}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":{input_tokens},\"cached_input_tokens\":{cached_input_tokens},\"output_tokens\":{output_tokens},\"total_tokens\":{}}}}}}}}}\n",
             input_tokens + output_tokens
         )
+    }
+
+    fn expected_local_date(timestamp: &str) -> String {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .expect("timestamp")
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
     }
 }

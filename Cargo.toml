@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/h3nock/codex-meter"
 
 [dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 crossterm = "0.29.0"
 memchr = "2.8.1"
 ratatui = "0.30.0"

@@ -1,12 +1,9 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    calendar::{date_days, date_from_system_time, date_string_from_days},
+    calendar::{date_days, date_string_from_days, local_date_from_system_time, local_today_days},
     codex::{SessionSummary, TokenUsage},
     cost_estimate::{CostDay, CostReport},
 };
@@ -84,17 +81,8 @@ pub fn build_usage_profile(
     let mut by_day: BTreeMap<String, DailyAccumulator> = BTreeMap::new();
     let mut model_tokens: HashMap<String, u64> = HashMap::new();
     for summary in summaries {
-        let mut session_dates = BTreeSet::new();
-        if let Some(date) = summary
-            .session_date
-            .clone()
-            .or_else(|| summary.activity_date.clone())
-            .or_else(|| summary.modified_at.and_then(date_from_system_time))
-        {
-            session_dates.insert(date);
-        }
-
         if !summary.daily_usage.is_empty() {
+            let mut session_dates = BTreeSet::new();
             for day_usage in &summary.daily_usage {
                 session_dates.insert(day_usage.date.clone());
                 record_token_day(
@@ -109,6 +97,16 @@ pub fn build_usage_profile(
             continue;
         }
 
+        let mut session_dates = BTreeSet::new();
+        if let Some(date) = summary
+            .activity_date
+            .clone()
+            .or_else(|| summary.session_date.clone())
+            .or_else(|| summary.modified_at.and_then(local_date_from_system_time))
+        {
+            session_dates.insert(date);
+        }
+
         let usage = summary.billable_usage();
         if !usage.has_tokens() {
             record_session_dates(&mut by_day, session_dates);
@@ -118,7 +116,7 @@ pub fn build_usage_profile(
         let Some(date) = summary
             .activity_date
             .clone()
-            .or_else(|| summary.modified_at.and_then(date_from_system_time))
+            .or_else(|| summary.modified_at.and_then(local_date_from_system_time))
         else {
             continue;
         };
@@ -144,21 +142,11 @@ pub fn build_usage_profile(
     let oldest_visible_day = newest_day.saturating_sub(PROFILE_DAYS - 1);
     daily.retain(|day| date_days(&day.date).is_some_and(|days| days >= oldest_visible_day));
 
-    let today = daily.last().map(|day| day.date.clone());
-    let today_tokens = today
-        .as_deref()
-        .and_then(|today| daily.iter().find(|day| day.date == today))
-        .map(|day| day.tokens)
-        .unwrap_or(0);
-    let last_30_cutoff = newest_day.saturating_sub(29);
-    let mut last_30_days_tokens = 0_u64;
-    for day in &daily {
-        if date_days(&day.date).is_some_and(|days| days >= last_30_cutoff) {
-            last_30_days_tokens = last_30_days_tokens.saturating_add(day.tokens);
-        }
-    }
+    let today = local_today_days();
+    let today_tokens = tokens_for_day(&daily, today);
+    let last_30_days_tokens = tokens_since(&daily, today.saturating_sub(29));
 
-    let activity_metrics = activity_metrics(&daily, current_day());
+    let activity_metrics = activity_metrics(&daily, today);
 
     let top_model = model_tokens
         .into_iter()
@@ -242,7 +230,8 @@ impl UsageProfile {
         self.peak_day_tokens = activity.peak_day_tokens;
         self.longest_task_seconds = activity.longest_task_seconds;
         self.recompute_activity_metrics();
-        self.activity_last_30_days_tokens = last_30_tokens_from_newest(&self.daily);
+        self.activity_last_30_days_tokens =
+            tokens_since(&self.daily, local_today_days().saturating_sub(29));
 
         if let Some(lifetime_tokens) = activity.lifetime_tokens {
             self.activity_total_tokens = lifetime_tokens;
@@ -301,22 +290,12 @@ impl UsageProfile {
             })
             .collect();
 
-        let newest_day = self
-            .billing_daily
-            .last()
-            .and_then(|day| date_days(&day.date))
-            .unwrap_or(0);
-        let last_30_cutoff = newest_day.saturating_sub(29);
-        self.today_tokens = self.billing_daily.last().map(|day| day.tokens).unwrap_or(0);
-        self.today_cost_usd = self.billing_daily.last().and_then(|day| day.cost_usd);
-        self.last_30_days_tokens = 0;
-        self.last_30_days_cost_usd = None;
-        for day in &self.billing_daily {
-            if date_days(&day.date).is_some_and(|days| days >= last_30_cutoff) {
-                self.last_30_days_tokens = self.last_30_days_tokens.saturating_add(day.tokens);
-                self.last_30_days_cost_usd = add_optional(self.last_30_days_cost_usd, day.cost_usd);
-            }
-        }
+        let today = local_today_days();
+        let last_30_cutoff = today.saturating_sub(29);
+        self.today_tokens = tokens_for_day(&self.billing_daily, today);
+        self.today_cost_usd = cost_for_day(&self.billing_daily, today);
+        self.last_30_days_tokens = tokens_since(&self.billing_daily, last_30_cutoff);
+        self.last_30_days_cost_usd = cost_since(&self.billing_daily, last_30_cutoff);
         if top_model.is_some() {
             self.top_model = top_model;
         }
@@ -330,7 +309,7 @@ impl UsageProfile {
     }
 
     fn recompute_activity_metrics(&mut self) {
-        let metrics = activity_metrics(&self.daily, current_day());
+        let metrics = activity_metrics(&self.daily, local_today_days());
         self.active_days = metrics.active_days;
         self.current_streak_days = metrics.current_streak_days;
         self.longest_streak_days = metrics.longest_streak_days;
@@ -340,19 +319,9 @@ impl UsageProfile {
     }
 
     fn apply_activity_tokens_to_usage_summary(&mut self) {
-        let newest_day = self
-            .daily
-            .last()
-            .and_then(|day| date_days(&day.date))
-            .unwrap_or_else(current_day);
-        let newest_date = date_string_from_days(newest_day);
-        self.today_tokens = self
-            .daily
-            .iter()
-            .find(|day| day.date == newest_date)
-            .map(|day| day.tokens)
-            .unwrap_or(0);
-        self.last_30_days_tokens = last_30_tokens_from_newest(&self.daily);
+        let today = local_today_days();
+        self.today_tokens = tokens_for_day(&self.daily, today);
+        self.last_30_days_tokens = tokens_since(&self.daily, today.saturating_sub(29));
         self.today_cost_usd = None;
         self.last_30_days_cost_usd = None;
         self.cost_source = None;
@@ -420,16 +389,34 @@ fn is_activity_day(day: &DailyUsage) -> bool {
     day.sessions > 0
 }
 
-fn last_30_tokens_from_newest(daily: &[DailyUsage]) -> u64 {
-    let Some(newest_day) = daily.last().and_then(|day| date_days(&day.date)) else {
-        return 0;
-    };
-    let last_30_cutoff = newest_day.saturating_sub(29);
+fn tokens_for_day(daily: &[DailyUsage], target_day: i64) -> u64 {
     daily
         .iter()
-        .filter(|day| date_days(&day.date).is_some_and(|days| days >= last_30_cutoff))
+        .find(|day| date_days(&day.date) == Some(target_day))
+        .map(|day| day.tokens)
+        .unwrap_or(0)
+}
+
+fn cost_for_day(daily: &[DailyUsage], target_day: i64) -> Option<f64> {
+    daily
+        .iter()
+        .find(|day| date_days(&day.date) == Some(target_day))
+        .and_then(|day| day.cost_usd)
+}
+
+fn tokens_since(daily: &[DailyUsage], cutoff_day: i64) -> u64 {
+    daily
+        .iter()
+        .filter(|day| date_days(&day.date).is_some_and(|days| days >= cutoff_day))
         .map(|day| day.tokens)
         .fold(0_u64, u64::saturating_add)
+}
+
+fn cost_since(daily: &[DailyUsage], cutoff_day: i64) -> Option<f64> {
+    daily
+        .iter()
+        .filter(|day| date_days(&day.date).is_some_and(|days| days >= cutoff_day))
+        .fold(None, |total, day| add_optional(total, day.cost_usd))
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -504,13 +491,6 @@ fn activity_metrics(daily: &[DailyUsage], today: i64) -> ActivityMetrics {
     }
 }
 
-fn current_day() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| (duration.as_secs() / 86_400) as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
@@ -522,9 +502,9 @@ mod tests {
     #[test]
     fn builds_daily_profile_and_streaks() {
         let summaries = vec![
-            summary("2026-06-01", 10),
-            summary("2026-06-02", 20),
-            summary("2026-06-03", 30),
+            summary(&date_offset(-2), 10),
+            summary(&date_offset(-1), 20),
+            summary(&date_offset(0), 30),
         ];
 
         let profile = build_usage_profile(&summaries, None, None);
@@ -537,15 +517,16 @@ mod tests {
     }
 
     #[test]
-    fn cost_report_does_not_replace_session_activity() {
-        let summaries = vec![summary("2026-06-03", 10)];
+    fn cost_report_keeps_session_activity_days() {
+        let summaries = vec![summary(&date_offset(0), 10)];
+        let first_day = local_today_days().saturating_sub(69);
         let cost_report = CostReport {
             source: "local estimate".to_string(),
             top_model: Some("gpt-5.5".to_string()),
             unpriced_tokens: 0,
             daily: (0..70)
                 .map(|offset| {
-                    let day = crate::calendar::date_days("2026-01-01").expect("date") + offset;
+                    let day = first_day + offset;
                     CostDay {
                         date: crate::calendar::date_string_from_days(day),
                         tokens: 100,
@@ -558,22 +539,23 @@ mod tests {
         let profile = build_usage_profile(&summaries, Some(cost_report), None);
 
         assert_eq!(profile.daily.len(), 1);
-        assert_eq!(profile.activity_total_tokens, 10);
+        assert_eq!(profile.activity_total_tokens, 100);
         assert_eq!(profile.active_days, 1);
-        assert_eq!(profile.activity_last_30_days_tokens, 10);
+        assert_eq!(profile.activity_last_30_days_tokens, 100);
         assert_eq!(profile.today_tokens, 100);
         assert_eq!(profile.last_30_days_tokens, 3_000);
     }
 
     #[test]
     fn cost_report_updates_activity_volume_for_session_days() {
-        let summaries = vec![summary("2026-06-03", 10)];
+        let today = date_offset(0);
+        let summaries = vec![summary(&today, 10)];
         let cost_report = CostReport {
             source: "local estimate".to_string(),
             top_model: Some("gpt-5.5".to_string()),
             unpriced_tokens: 0,
             daily: vec![CostDay {
-                date: "2026-06-03".to_string(),
+                date: today,
                 tokens: 100,
                 cost_usd: Some(1.0),
             }],
@@ -589,12 +571,13 @@ mod tests {
 
     #[test]
     fn cost_report_does_not_create_activity_days() {
+        let today = date_offset(0);
         let cost_report = CostReport {
             source: "local estimate".to_string(),
             top_model: Some("gpt-5.5".to_string()),
             unpriced_tokens: 0,
             daily: vec![CostDay {
-                date: "2026-06-03".to_string(),
+                date: today,
                 tokens: 100,
                 cost_usd: Some(1.0),
             }],
@@ -655,8 +638,11 @@ mod tests {
 
     #[test]
     fn indexed_activity_replaces_jsonl_activity_without_replacing_billing() {
-        let summaries = vec![summary("2026-06-03", 10)];
-        let indexed_activity = vec![day("2026-06-01", 100, 1), day("2026-06-02", 200, 1)];
+        let today = date_offset(0);
+        let yesterday = date_offset(-1);
+        let two_days_ago = date_offset(-2);
+        let summaries = vec![summary(&today, 10)];
+        let indexed_activity = vec![day(&two_days_ago, 100, 1), day(&yesterday, 200, 1)];
 
         let profile = build_usage_profile(&summaries, None, Some(indexed_activity));
 
@@ -671,15 +657,18 @@ mod tests {
                 .iter()
                 .map(|day| (day.date.as_str(), day.tokens, day.sessions))
                 .collect::<Vec<_>>(),
-            vec![("2026-06-01", 100, 1), ("2026-06-02", 200, 1)]
+            vec![
+                (two_days_ago.as_str(), 100, 1),
+                (yesterday.as_str(), 200, 1)
+            ]
         );
     }
 
     #[test]
     fn remote_profile_activity_overrides_local_activity_metrics() {
-        let today = current_day();
+        let today = local_today_days();
         let yesterday = today.saturating_sub(1);
-        let mut profile = build_usage_profile(&[summary("2026-06-01", 10)], None, None);
+        let mut profile = build_usage_profile(&[summary(&date_offset(-2), 10)], None, None);
 
         profile.apply_remote_activity(ProfileActivity {
             daily: vec![
@@ -710,7 +699,7 @@ mod tests {
 
     #[test]
     fn remote_profile_activity_keeps_explicit_cost_report_totals() {
-        let today = date_string_from_days(current_day());
+        let today = date_string_from_days(local_today_days());
         let cost_report = CostReport {
             source: "local estimate".to_string(),
             top_model: Some("gpt-5.5".to_string()),
@@ -826,5 +815,9 @@ mod tests {
             session_date: Some(date.to_string()),
             ..SessionSummary::default()
         }
+    }
+
+    fn date_offset(offset: i64) -> String {
+        date_string_from_days(local_today_days().saturating_add(offset))
     }
 }

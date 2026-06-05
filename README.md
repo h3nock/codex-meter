@@ -8,8 +8,8 @@ It shows remaining quota, reset timing, token volume, estimated cost, and activi
 
 - Session and weekly quota remaining
 - Reset timing and pace status
-- Latest day and 30-day token totals
-- Estimated latest day and 30-day cost
+- Today and 30-day token totals
+- Estimated today and 30-day cost
 - Top model
 - Token activity calendar
 - Used days, current streak, and longest streak

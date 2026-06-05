@@ -12,7 +12,7 @@ use ratatui::{
 };
 
 use crate::{
-    calendar::{date_days, date_string_from_days},
+    calendar::{date_days, date_string_from_days, local_today_days},
     cli::DashboardOptions,
     codex::{CostStatus, MeterSnapshot, RateWindow},
     format,
@@ -214,7 +214,7 @@ fn draw_usage_breakdown(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&Met
         Line::from(vec![muted("period        cost          tokens")]),
         Line::from(""),
         usage_table_line(
-            "Latest day",
+            "Today",
             &cost_label(profile.today_cost_usd, snapshot.cost_status),
             &format::tokens(profile.today_tokens),
         ),
@@ -242,7 +242,7 @@ fn draw_usage_breakdown(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&Met
         Paragraph::new(Line::from(vec![
             muted("30-day token volume"),
             muted("   "),
-            value(&date_range_label(daily, 30), TEXT),
+            value(&date_range_label(30), TEXT),
         ]))
         .style(Style::default().bg(PANEL)),
         chart_rows[0],
@@ -413,10 +413,7 @@ fn daily_token_series(daily: &[DailyUsage], days: usize) -> Vec<u64> {
         return vec![0; days.max(1)];
     }
 
-    let newest_day = daily
-        .last()
-        .and_then(|day| date_days(&day.date))
-        .unwrap_or_else(today_days);
+    let newest_day = local_today_days();
     let by_day = daily
         .iter()
         .filter_map(|day| date_days(&day.date).map(|date| (date, day.tokens)))
@@ -428,11 +425,8 @@ fn daily_token_series(daily: &[DailyUsage], days: usize) -> Vec<u64> {
         .collect()
 }
 
-fn date_range_label(daily: &[DailyUsage], days: usize) -> String {
-    let newest_day = daily
-        .last()
-        .and_then(|day| date_days(&day.date))
-        .unwrap_or_else(today_days);
+fn date_range_label(days: usize) -> String {
+    let newest_day = local_today_days();
     let start_day = newest_day.saturating_sub(days.saturating_sub(1) as i64);
     format!(
         "{} to {}",
@@ -827,13 +821,6 @@ fn month_name(month: &str) -> &'static str {
     }
 }
 
-fn today_days() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| (duration.as_secs() / 86_400) as i64)
-        .unwrap_or(0)
-}
-
 fn metric(label: &str, metric_value: &str, color: Color) -> Span<'static> {
     Span::styled(
         format!("{metric_value} {label}"),
@@ -1119,7 +1106,7 @@ mod tests {
     #[test]
     fn daily_series_fills_empty_days() {
         let daily = vec![DailyUsage {
-            date: "2026-06-03".to_string(),
+            date: date_string_from_days(local_today_days()),
             tokens: 10,
             cost_usd: None,
             sessions: 1,

@@ -1,13 +1,39 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
-pub fn date_from_timestamp(timestamp: &str) -> Option<&str> {
-    let date = timestamp.get(0..10)?;
-    (date.as_bytes().get(4) == Some(&b'-') && date.as_bytes().get(7) == Some(&b'-')).then_some(date)
+use chrono::{DateTime, Local};
+
+pub fn is_date_label(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+        && value.get(0..4).is_some_and(is_ascii_digits)
+        && value.get(5..7).is_some_and(is_ascii_digits)
+        && value.get(8..10).is_some_and(is_ascii_digits)
+        && date_days(value).is_some_and(|days| date_string_from_days(days) == value)
 }
 
-pub fn date_from_system_time(time: SystemTime) -> Option<String> {
-    let seconds = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    Some(date_string_from_days((seconds / 86_400) as i64))
+pub fn local_date_from_timestamp(timestamp: &str) -> Option<String> {
+    let datetime = DateTime::parse_from_rfc3339(timestamp).ok()?;
+    Some(format_date(datetime.with_timezone(&Local).date_naive()))
+}
+
+pub fn local_date_from_system_time(time: SystemTime) -> Option<String> {
+    let datetime = DateTime::<Local>::from(time);
+    Some(format_date(datetime.date_naive()))
+}
+
+pub fn local_date_from_unix_seconds(seconds: u64) -> Option<String> {
+    let seconds = i64::try_from(seconds).ok()?;
+    let datetime = DateTime::from_timestamp(seconds, 0)?;
+    Some(format_date(datetime.with_timezone(&Local).date_naive()))
+}
+
+pub fn local_day_from_system_time(time: SystemTime) -> Option<i64> {
+    local_date_from_system_time(time).and_then(|date| date_days(&date))
+}
+
+pub fn local_today_days() -> i64 {
+    local_day_from_system_time(SystemTime::now()).unwrap_or(0)
 }
 
 pub fn date_days(date: &str) -> Option<i64> {
@@ -20,6 +46,14 @@ pub fn date_days(date: &str) -> Option<i64> {
 pub fn date_string_from_days(days: i64) -> String {
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn is_ascii_digits(value: &str) -> bool {
+    value.as_bytes().iter().all(u8::is_ascii_digit)
+}
+
+fn format_date(date: chrono::NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
 }
 
 fn date_days_parts(year: i32, month: u32, day: u32) -> i64 {
@@ -58,10 +92,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_timestamp_date() {
-        assert_eq!(
-            date_from_timestamp("2026-06-03T10:00:01Z"),
-            Some("2026-06-03")
-        );
+    fn validates_date_labels() {
+        assert!(is_date_label("2026-06-03"));
+        assert!(!is_date_label("2026-99-03"));
+        assert!(!is_date_label("2026-06-3"));
+    }
+
+    #[test]
+    fn converts_timestamp_to_machine_local_date() {
+        let timestamp = "2026-06-03T10:00:01Z";
+        let expected = DateTime::parse_from_rfc3339(timestamp)
+            .expect("timestamp")
+            .with_timezone(&Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        assert_eq!(local_date_from_timestamp(timestamp), Some(expected));
+    }
+
+    #[test]
+    fn rejects_out_of_range_unix_seconds() {
+        assert_eq!(local_date_from_unix_seconds(u64::MAX), None);
     }
 }

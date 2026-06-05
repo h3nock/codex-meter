@@ -11,14 +11,14 @@ use memchr::{memchr_iter, memmem};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    calendar::{date_days, date_from_timestamp},
+    calendar::{date_days, local_date_from_timestamp},
     codex::TokenUsage,
     error::{AppError, AppResult},
     pricing,
     state_db::CostThread,
 };
 
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 const READ_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_COST_LINE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -522,10 +522,7 @@ fn apply_cost_entry(
         return;
     }
 
-    let Some(date) = entry_timestamp
-        .and_then(date_from_timestamp)
-        .map(ToOwned::to_owned)
-    else {
+    let Some(date) = entry_timestamp.and_then(local_date_from_timestamp) else {
         return;
     };
     let model = payload
@@ -1132,6 +1129,52 @@ mod tests {
         assert!((cost - 1.70).abs() < 1e-9);
 
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn estimator_buckets_cost_by_machine_local_date() {
+        let root = unique_temp_dir("codex-meter-local-cost-date");
+        std::fs::create_dir_all(&root).expect("create root");
+        let path = root.join("session.jsonl");
+        let timestamp = "2026-06-05T00:10:00Z";
+        let expected_date = expected_local_date(timestamp);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"{timestamp}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"session\"}}}}\n\
+                 {{\"timestamp\":\"{timestamp}\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\"}}}}\n\
+                 {{\"timestamp\":\"{timestamp}\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":1000,\"cached_input_tokens\":500,\"output_tokens\":100,\"total_tokens\":1100}}}}}}}}\n"
+            ),
+        )
+        .expect("write session");
+        let threads = vec![CostThread {
+            id: "session".to_string(),
+            rollout_path: path,
+            model: Some("gpt-5.5".to_string()),
+            parent_thread_id: None,
+            parent_rollout_path: None,
+        }];
+
+        let mut estimator = CostEstimator::with_cache_path(root.join("cache.json"));
+        let report = estimator
+            .estimate(&threads, date_days("2026-06-01").expect("date"))
+            .expect("estimate")
+            .report
+            .expect("report");
+
+        assert_eq!(report.daily[0].date, expected_date);
+        assert_eq!(report.daily[0].tokens, 1_100);
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn expected_local_date(timestamp: &str) -> String {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .expect("timestamp")
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
     }
 
     #[test]

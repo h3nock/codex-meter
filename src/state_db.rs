@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -7,6 +7,7 @@ use std::{
 use rusqlite::{Connection, OpenFlags};
 
 use crate::{
+    calendar::local_date_from_unix_seconds,
     error::{AppError, AppResult},
     profile::DailyUsage,
 };
@@ -44,14 +45,12 @@ pub fn load_thread_activity(codex_home: &Path) -> AppResult<Option<ThreadActivit
         .prepare(
             "
             SELECT
-                date(created_at, 'unixepoch') AS day,
-                COALESCE(SUM(CASE WHEN tokens_used > 0 THEN tokens_used ELSE 0 END), 0) AS tokens,
-                COUNT(*) AS sessions
+                created_at,
+                CASE WHEN tokens_used > 0 THEN tokens_used ELSE 0 END AS tokens
             FROM threads
             WHERE created_at > 0
               AND (tokens_used > 0 OR has_user_event != 0)
-            GROUP BY day
-            ORDER BY day
+            ORDER BY created_at
             ",
         )
         .map_err(|source| {
@@ -66,14 +65,9 @@ pub fn load_thread_activity(codex_home: &Path) -> AppResult<Option<ThreadActivit
 
     let rows = statement
         .query_map([], |row| {
+            let created_at: i64 = row.get(0)?;
             let tokens: i64 = row.get(1)?;
-            let sessions: i64 = row.get(2)?;
-            Ok(DailyUsage {
-                date: row.get(0)?,
-                tokens: u64::try_from(tokens.max(0)).unwrap_or(0),
-                cost_usd: None,
-                sessions: u64::try_from(sessions.max(0)).unwrap_or(0),
-            })
+            Ok((created_at, tokens))
         })
         .map_err(|source| {
             AppError::sqlite(
@@ -82,21 +76,48 @@ pub fn load_thread_activity(codex_home: &Path) -> AppResult<Option<ThreadActivit
             )
         })?;
 
-    let mut daily = Vec::new();
+    let mut by_day = BTreeMap::<String, DailyUsageAccumulator>::new();
     for row in rows {
-        daily.push(row.map_err(|source| {
+        let (created_at, tokens) = row.map_err(|source| {
             AppError::sqlite(
                 format!("failed to decode thread activity from {}", path.display()),
                 source,
             )
-        })?);
+        })?;
+        let Some(date) = u64::try_from(created_at)
+            .ok()
+            .and_then(local_date_from_unix_seconds)
+        else {
+            continue;
+        };
+        let day = by_day.entry(date).or_default();
+        day.tokens = day
+            .tokens
+            .saturating_add(u64::try_from(tokens.max(0)).unwrap_or(0));
+        day.sessions = day.sessions.saturating_add(1);
     }
+
+    let daily = by_day
+        .into_iter()
+        .map(|(date, day)| DailyUsage {
+            date,
+            tokens: day.tokens,
+            cost_usd: None,
+            sessions: day.sessions,
+        })
+        .collect::<Vec<_>>();
 
     if daily.is_empty() {
         Ok(None)
     } else {
         Ok(Some(ThreadActivityReport { daily }))
     }
+}
+
+#[derive(Default)]
+struct DailyUsageAccumulator {
+    tokens: u64,
+    sessions: u64,
 }
 
 pub fn load_cost_thread_metadata(
@@ -215,18 +236,20 @@ mod tests {
         drop(connection);
 
         let report = load_thread_activity(&root).expect("load").expect("report");
+        let first_day = expected_local_date_from_unix_seconds(1780444800);
+        let second_day = expected_local_date_from_unix_seconds(1780531200);
 
         assert_eq!(
             report.daily,
             vec![
                 DailyUsage {
-                    date: "2026-06-03".to_string(),
+                    date: first_day,
                     tokens: 30,
                     cost_usd: None,
                     sessions: 2,
                 },
                 DailyUsage {
-                    date: "2026-06-04".to_string(),
+                    date: second_day,
                     tokens: 0,
                     cost_usd: None,
                     sessions: 1,
@@ -284,5 +307,14 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+    }
+
+    fn expected_local_date_from_unix_seconds(seconds: i64) -> String {
+        chrono::DateTime::from_timestamp(seconds, 0)
+            .expect("timestamp")
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
     }
 }
