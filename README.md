@@ -4,6 +4,8 @@
 
 It shows remaining quota, reset timing, token volume, estimated cost, and activity history using Codex account data and local Codex session data.
 
+![codex-meter dashboard](assets/codex-meter.png)
+
 ## Features
 
 - Session and weekly quota remaining
